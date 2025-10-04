@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cleany-cli"
+version = "0.1.0"
+description = "Interactive CLI tool to clean and prune tabular data files"
+authors = [
+  { name = "espehon", email = "espehon@gmail.com" }
+]
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.8"
+dependencies = [
+  "pandas>=2.0",
+  "questionary>=2.0",
+  "pyarrow>=14.0",  # optional, for fast CSV/Parquet handling
+]
+
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Developers",
+  "Topic :: Software Development :: Data Cleaning",
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.8",
+  "Programming Language :: Python :: 3.9",
+  "Programming Language :: Python :: 3.10",
+  "Operating System :: OS Independent"
+]
+
+[project.urls]
+Homepage = "https://github.com/espehon/cleany-cli"
+Repository = "https://github.com/espehon/cleany-cli"
+Issues = "https://github.com/espehon/cleany-cli/issues"
+
+[project.scripts]
+cleany = "cleany_cli.__main__:main"
