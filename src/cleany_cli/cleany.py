@@ -122,8 +122,8 @@ def get_file_list() -> list:
     return file_list
 
 
-def count_rows(reader: Iterator[pd.DataFrame]) -> int:
-    return sum(len(chunk) for chunk in reader)
+# def count_rows(reader: Iterator[pd.DataFrame]) -> int:
+#     return sum(len(chunk) for chunk in reader)
 
 
 def find_file(filepath: str="") -> str:
@@ -264,6 +264,21 @@ def prompt_drop_columns(reader: Iterator[pd.DataFrame]) -> Callable:
     return dropper
 
 
+def apply_transformations(chunk: pd.DataFrame, transforms: list[Callable[[pd.DataFrame], pd.DataFrame]]) -> pd.DataFrame:
+    for fn in transforms:
+        chunk = fn(chunk)
+    return chunk
+
+def preview_transformed(reader: Iterator[pd.DataFrame], transforms: list[Callable[[pd.DataFrame], pd.DataFrame]]) -> None:
+    row_count = 0
+    for chunk in reader:
+        transformed = apply_transformations(chunk, transforms)
+        preview_full_dataset(iter([transformed]))  # preview just one chunk
+        row_count += len(transformed)
+    input(f" {row_count:,d} rows previewed. Press Enter to continue...")
+
+
+
 
 
 
@@ -275,11 +290,11 @@ def cleany(argument: str="") -> None:
     if file == "":
         print("Error: No file selected.")
         sys.exit(1)
-    reader = load_file(file)
 
     # Main loop
     looping = True
     transformations: list[Callable[[pd.DataFrame], pd.DataFrame]] = []
+    reader = load_file(file)
     while looping:
         action = q.select("Select an action:", choices=features + ["Exit"]).ask()
 
@@ -288,8 +303,6 @@ def cleany(argument: str="") -> None:
             sys.exit(0)
         elif action == "Preview data (datatypes, sample rows, summary statistics)":
             preview_full_dataset(reader)
-            reader = load_file(file)
-            input(f" {count_rows(reader):,d} rows. Press Enter to continue...")
             reader = load_file(file)
         elif action == "Remove columns":
             drop_fn = prompt_drop_columns(reader)
