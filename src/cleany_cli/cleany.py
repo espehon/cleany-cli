@@ -5,9 +5,10 @@
 # Standard library imports
 import sys
 import os
-from typing import Union, Iterator, Optional, Callable
+from typing import Union, Iterator, Optional, Callable, Any
 from collections import defaultdict
 from dataclasses import dataclass, field
+from abc import ABC, abstractmethod
 
 # Third-party imports
 import pandas as pd
@@ -38,6 +39,7 @@ header_widths = {
 
 features = [
     "Preview data (datatypes, sample rows, summary statistics)",
+    "Normalize currency/percent columns",
     # "Rename columns",
     # "Remove columns",
     # "Remove duplicate rows",
@@ -50,6 +52,138 @@ features = [
 
 
 # endregion
+# region: Transformation Pipeline
+
+class Transform(ABC):
+    """Base class for all transformations. Each transform is a reusable operation."""
+    
+    @abstractmethod
+    def apply(self, chunk: pd.DataFrame) -> pd.DataFrame:
+        """Apply this transformation to a chunk of data."""
+        pass
+    
+    @abstractmethod
+    def describe(self) -> str:
+        """Return a human-readable description of this transformation."""
+        pass
+
+
+class DropColumnsTransform(Transform):
+    """Remove specific columns from the dataframe."""
+    
+    def __init__(self, columns: list[str]):
+        self.columns = columns
+    
+    def apply(self, chunk: pd.DataFrame) -> pd.DataFrame:
+        return chunk.drop(columns=self.columns, errors='ignore')
+    
+    def describe(self) -> str:
+        return f"Drop columns: {', '.join(self.columns)}"
+
+
+class NormalizeCurrencyPercentTransform(Transform):
+    """Normalize currency and percent strings into numeric floats.
+
+    Behavior:
+    - Strips leading `$` and thousands separators (commas).
+    - If value ends with `%`, removes `%` and divides by 100.
+    - Attempts to coerce the cleaned values to numeric; if at least one
+      value coerces successfully, it replaces the column with the numeric
+      values (NaN where coercion failed).
+    """
+
+    def __init__(self, columns: Optional[list[str]] = None):
+        # If columns is None, operate on all object columns where pattern matches
+        self.columns = columns
+
+    def apply(self, chunk: pd.DataFrame) -> pd.DataFrame:
+        df = chunk.copy()
+        candidates = self.columns or df.select_dtypes(include=['object', 'string']).columns.tolist()
+        for col in candidates:
+            if col not in df.columns:
+                continue
+            try:
+                s = df[col].astype(str).str.strip()
+            except Exception:
+                continue
+
+            # Quick check if any value looks like currency or percent or numeric-like with commas
+            mask_currency = s.str.startswith('$', na=False)
+            mask_percent = s.str.endswith('%', na=False)
+            mask_commas = s.str.contains(',', na=False)
+            mask_numeric_like = s.str.match(r'^-?[0-9\.,]+%?$', na=False)
+
+            if not (mask_currency.any() or mask_percent.any() or mask_commas.any() or mask_numeric_like.any()):
+                continue
+
+            cleaned = s.str.replace(r'^\$', '', regex=True).str.replace(',', '')
+            pct_mask = cleaned.str.endswith('%', na=False)
+            cleaned_num = cleaned.str.rstrip('%')
+            cleaned_num = cleaned_num.replace({'nan': None, 'None': None})
+            coerced = pd.to_numeric(cleaned_num, errors='coerce')
+            if pct_mask.any():
+                coerced.loc[pct_mask] = coerced.loc[pct_mask] / 100.0
+
+            # If at least one value converted to numeric, replace the column with coerced
+            if coerced.notna().any():
+                df[col] = coerced
+
+        return df
+
+    def describe(self) -> str:
+        if self.columns:
+            return f"Normalize currency/percent in columns: {', '.join(self.columns)}"
+        return "Normalize currency/percent in inferred columns"
+
+
+class TransformationStack:
+    """
+    Manages a stack of transformations to be applied to data streams.
+    
+    Instead of modifying data immediately, we build up a list of transformations
+    that get applied each time we stream through the file. This preserves the 
+    original file and makes it easy to undo/redo operations.
+    """
+    
+    def __init__(self):
+        self.transforms: list[Transform] = []
+    
+    def add(self, transform: Transform) -> None:
+        """Add a transformation to the stack."""
+        self.transforms.append(transform)
+    
+    def remove_last(self) -> Optional[Transform]:
+        """Undo the last transformation."""
+        if self.transforms:
+            return self.transforms.pop()
+        return None
+    
+    def apply_to_chunk(self, chunk: pd.DataFrame) -> pd.DataFrame:
+        """Apply all transformations in order to a single chunk."""
+        for transform in self.transforms:
+            chunk = transform.apply(chunk)
+        return chunk
+    
+    def apply_to_stream(self, reader: Iterator[pd.DataFrame]) -> Iterator[pd.DataFrame]:
+        """
+        Apply all transformations to each chunk in a stream.
+        This is the key pattern: transformations are applied chunk-by-chunk,
+        keeping memory usage low.
+        """
+        for chunk in reader:
+            yield self.apply_to_chunk(chunk)
+    
+    def describe(self) -> str:
+        """Return a list of all transformations in the stack."""
+        if not self.transforms:
+            return "No transformations applied"
+        lines = ["Active transformations:"]
+        for i, transform in enumerate(self.transforms, 1):
+            lines.append(f"  {i}. {transform.describe()}")
+        return "\n".join(lines)
+
+
+# endregion
 # region: Classes
 
 
@@ -58,8 +192,9 @@ class ColumnStats:
     dtype: Optional[str] = None
     missing: int = 0
     total: int = 0
-    min: Optional[str] = None
-    max: Optional[str] = None
+    # Store native min/max values (numbers, datetimes, or strings) to allow safe comparisons
+    min: Optional[Any] = None
+    max: Optional[Any] = None
     mean_sum: float = 0.0
     mean_count: int = 0
     samples: set[str] = field(default_factory=set)
@@ -99,7 +234,7 @@ def inspect_argument(arg: str) -> None:
     if arg in ('-?', '--help'):
         help()
         sys.exit(0)
-    elif arg[0] in ('-', '<', '>', ':', '|', '?', '*', '$', '@', '!'):
+    elif arg and arg[0] in ('-', '<', '>', ':', '|', '?', '*', '$', '@', '!'):
         print("Unrecognized argument. Use -? or --help for usage information.")
         sys.exit(1)
     else:
@@ -148,20 +283,106 @@ def find_file(filepath: str="") -> str:
         sys.exit(0)
 
 
-def load_file(filepath: str, chunksize: int = 10000) -> Iterator[pd.DataFrame]:
+def detect_leading_zero_columns(filepath: str, sample_size: int = 1000) -> tuple[dict[str, type], list[str]]:
+    """
+    Scan a file to detect columns that contain:
+    1. Numbers with leading zeros (not decimals) → mark as text (IDs, SKUs, codes)
+    2. Dates → return as parse_dates list
+    
+    Returns: (dtype_dict, parse_dates_list)
+    """
+    ext = os.path.splitext(filepath)[-1].lower()
+    
+    # Load just the first sample as strings to preserve leading zeros
+    if ext == '.csv':
+        df_sample = pd.read_csv(filepath, nrows=sample_size, dtype=str)
+    elif ext == '.tsv':
+        df_sample = pd.read_csv(filepath, sep='\t', nrows=sample_size, dtype=str)
+    elif ext in ('.xlsx', '.xls'):
+        df_sample = pd.read_excel(filepath, nrows=sample_size)
+        df_sample = df_sample.astype(str)
+    elif ext == '.json':
+        df_sample = pd.read_json(filepath)
+        df_sample = df_sample.astype(str)
+    elif ext == '.parquet':
+        df_sample = pd.read_parquet(filepath)
+        df_sample = df_sample.astype(str)
+    elif ext == '.feather':
+        df_sample = pd.read_feather(filepath)
+        df_sample = df_sample.astype(str)
+    elif ext == '.xml':
+        df_sample = pd.read_xml(filepath)
+        df_sample = df_sample.astype(str)
+    else:
+        return {}, []
+    
+    def is_numeric_like(val_str: str) -> bool:
+        """Check if a string looks like a number."""
+        if not val_str:
+            return False
+        try:
+            float(val_str)
+            return True
+        except ValueError:
+            return False
+    
+    def is_date_like(val_str: str) -> bool:
+        """Check if a string looks like a date (YYYY-MM-DD or similar formats)."""
+        if not val_str:
+            return False
+        try:
+            pd.to_datetime(val_str)
+            # Check if it actually looks like a date pattern (has dashes or slashes)
+            return '-' in val_str or '/' in val_str
+        except:
+            return False
+    
+    dtype_dict = {}
+    date_cols = []
+    
+    for col in df_sample.columns:
+        # First check for dates
+        is_date_col = False
+        for val in df_sample[col].dropna():
+            val_str = str(val).strip()
+            if val_str and is_date_like(val_str):
+                date_cols.append(col)
+                is_date_col = True
+                break
+        
+        if is_date_col:
+            continue  # Skip further checks for this column
+        
+        # Then check for leading zeros
+        for val in df_sample[col].dropna():
+            val_str = str(val).strip()
+            
+            if not val_str:
+                continue
+            
+            # If we find ANY numeric value with leading zero (not decimal), mark column as text
+            # e.g., "011111" → text, but "0.5" → number (don't mark)
+            if is_numeric_like(val_str) and val_str[0] == '0' and len(val_str) > 1 and val_str[1] != '.':
+                dtype_dict[col] = str
+                break  # Found one, no need to check rest of column
+    
+    return dtype_dict, date_cols
+
+
+def load_file(filepath: str, chunksize: int = 10000, dtype: Optional[dict] = None, parse_dates: Optional[list] = None) -> Iterator[pd.DataFrame]:
     ext = os.path.splitext(filepath)[-1].lower()
     file_size = os.path.getsize(filepath)
 
     # Chunked loading for large streamable files
     if file_size > FILE_SIZE_LIMIT and ext in STREAMABLE:
         sep = ',' if ext == '.csv' else '\t'
-        return pd.read_csv(filepath, sep=sep, chunksize=chunksize)
+        return pd.read_csv(filepath, sep=sep, chunksize=chunksize, dtype=dtype, parse_dates=parse_dates)
 
     # Full load + manual chunking
     if ext == '.csv':
-        df = pd.read_csv(filepath)
+        df = pd.read_csv(filepath, dtype=dtype, parse_dates=parse_dates)
     elif ext == '.tsv':
-        df = pd.read_csv(filepath, sep='\t')
+        df = pd.read_csv(filepath, sep='\t', dtype=dtype, parse_dates=parse_dates)
     elif ext in ('.xlsx', '.xls'):
         df = pd.read_excel(filepath)
     elif ext == '.json':
@@ -183,13 +404,131 @@ def format_percent(number, total):
     pct = (number / total) * 100 if total else 0
     return f"{pct:6.2f}%"
 
-def truncate(text, width):
-    return text[:width-1] + '…' if len(text) > width else text.ljust(width)
+def format_number(value: Optional[Any], width: int, dtype_hint: Optional[str] = None) -> str:
+    """
+    Format a value for display according to dtype_hint.
+    - For 'int': render as integer (no .00), right-aligned
+    - For 'float': round to 2 decimals, scientific notation if too wide
+    - For 'date': format as YYYY-MM-DD (short)
+    - For others: truncate and right-align
+    """
+    if value is None or value == "":
+        return "".rjust(width)
 
-def preview_full_dataset(data: Iterator[pd.DataFrame], sample_size: int = 1) -> None:
+    # If already a pandas Timestamp or datetime
+    try:
+        if dtype_hint == 'date':
+            dt = pd.to_datetime(value)
+            s = dt.strftime('%Y-%m-%d')
+            return s.rjust(width)[:width]
+    except Exception:
+        pass
+
+    # Explicit string handling: don't try to coerce to numeric
+    if dtype_hint == 'str':
+        return str(value)[:width].rjust(width)
+
+    # Integers
+    if dtype_hint == 'int' or (isinstance(value, (int,))):
+        try:
+            iv = int(float(value))
+            s = str(iv)
+            return s.rjust(width)[:width]
+        except Exception:
+            return str(value)[:width].rjust(width)
+
+    # Floats / numeric
+    try:
+        num = float(value)
+        # If dtype_hint explicitly int, we handled above. For float, format with 2 decimals
+        formatted = f"{num:.2f}"
+        if len(formatted) <= width:
+            return formatted.rjust(width)
+        sci = f"{num:.2e}"
+        if len(sci) <= width:
+            return sci.rjust(width)
+        return sci[:width].rjust(width)
+    except Exception:
+        # Fallback: text
+        return str(value)[:width].rjust(width)
+
+def truncate(text, width):
+    """Return a truncated string (no padding). Caller should pad to width."""
+    if text is None:
+        return ""
+    text = str(text)
+    return text[: width - 1] + '…' if len(text) > width else text
+
+def print_table_row(columns: list[str], widths: dict[str, int], is_header: bool = False, is_bottom: bool = False) -> None:
+    """Print a row of the table with box characters and column separators."""
+    if is_header:
+        # Header: use box-drawing characters
+        left = "┌"
+        mid = "┬"
+        right = "┐"
+        sep = "─"
+    elif is_bottom:
+        # Bottom border
+        left = "└"
+        mid = "┴"
+        right = "┘"
+        sep = "─"
+    else:
+        # Data row separator
+        left = "├"
+        mid = "┼"
+        right = "┤"
+        sep = "─"
+    
+    parts = [left]
+    for i, col in enumerate(columns):
+        parts.append(sep * widths[col])
+        if i < len(columns) - 1:
+            parts.append(mid)
+    parts.append(right)
+    print("".join(parts))
+
+def print_table_content(columns: list[str], values: dict[str, str], widths: dict[str, int]) -> None:
+    """Print a data row with vertical separators.
+
+    Pads each column to its configured width. Alignment is column-specific:
+    - left for `Column` and `dtype`
+    - right for numeric columns and `Sample`
+    """
+    alignments = {
+        "Column": "left",
+        "dtype": "left",
+        "Missing": "right",
+        "Minimum": "right",
+        "Average": "right",
+        "Maximum": "right",
+        "Sample": "right",
+    }
+
+    parts = ["│"]
+    for col in columns:
+        raw = values.get(col, "")
+        w = widths[col]
+        if alignments.get(col, "left") == "right":
+            padded = str(raw)[:w].rjust(w)
+        else:
+            padded = str(raw)[:w].ljust(w)
+        parts.append(padded)
+        parts.append("│")
+    print("".join(parts))
+
+def preview_full_dataset(data: Iterator[pd.DataFrame], sample_size: int = 1, dtype_hints: Optional[dict] = None) -> None:
     headers = list(header_widths.keys())
-    print("".join(h.ljust(header_widths[h]) for h in headers))
-    print("-" * sum(header_widths.values()))
+    
+    # Print top border
+    print_table_row(headers, header_widths, is_header=True)
+    
+    # Print header row
+    header_row = {h: h.ljust(header_widths[h]) for h in headers}
+    print_table_content(headers, header_row, header_widths)
+    
+    # Print header separator
+    print_table_row(headers, header_widths)
 
     stats: dict[str, ColumnStats] = defaultdict(ColumnStats)
 
@@ -201,48 +540,206 @@ def preview_full_dataset(data: Iterator[pd.DataFrame], sample_size: int = 1) -> 
             if col_stats.dtype is None:
                 col_stats.dtype = str(series.dtype)
 
-            col_stats.missing += series.isnull().sum()
+            # Count missing values: empty strings and nulls should be counted once
+            mask_missing = series.isnull() | (series.astype(str).str.strip() == '')
+            missing_count = mask_missing.sum()
+            col_stats.missing += int(missing_count)
             col_stats.total += len(series)
 
-            non_null = series.dropna()
+            # Prepare cleaned series for numeric/date detection:
+            # If strings contain leading '$' or trailing '%', normalize them into numeric values
+            cleaned_series = series
+            numeric_series = None
+            try:
+                s_str = series.astype(str).str.strip()
+            except Exception:
+                s_str = series
 
-            if pd.api.types.is_numeric_dtype(series):
-                min_val = non_null.min()
-                max_val = non_null.max()
-                col_stats.min = str(min(min_val, float(col_stats.min)) if col_stats.min else min_val)
-                col_stats.max = str(max(max_val, float(col_stats.max)) if col_stats.max else max_val)
-                col_stats.mean_sum += non_null.sum()
-                col_stats.mean_count += non_null.shape[0]
+            # Create cleaned numeric candidate by removing $ and commas, stripping %
+            try:
+                cleaned = (
+                    s_str
+                    .str.replace(r'^\$', '', regex=True)
+                    .str.replace(',', '')
+                )
+                # mark percent mask
+                mask_pct = cleaned.str.endswith('%', na=False)
+                cleaned_numeric = cleaned.str.rstrip('%')
+                # convert 'nan' back to actual NaN so to_numeric will coerce
+                cleaned_numeric = cleaned_numeric.replace({'nan': None, 'None': None})
+                numeric_series = pd.to_numeric(cleaned_numeric, errors='coerce')
+                if mask_pct.any():
+                    numeric_series.loc[mask_pct] = numeric_series.loc[mask_pct] / 100.0
+            except Exception:
+                numeric_series = None
+
+            # If the column is forced to str by dtype hints, skip numeric normalization
+            if dtype_hints and col in dtype_hints and dtype_hints[col] is str:
+                numeric_series = None
+
+            # If the column is numeric-like (either inferred dtype or cleaned numeric has values), use numeric_series
+            if pd.api.types.is_numeric_dtype(series) or (numeric_series is not None and numeric_series.notna().any()):
+                # Prefer numeric_series if available (handles $ and % normalization)
+                use_numeric = numeric_series if numeric_series is not None else pd.to_numeric(series, errors='coerce')
+                non_null_num = use_numeric[use_numeric.notna()]
+                if not non_null_num.empty:
+                    min_val = non_null_num.min()
+                    max_val = non_null_num.max()
+                    # Store native numeric min/max values
+                    if col_stats.min is None:
+                        col_stats.min = min_val
+                    else:
+                        try:
+                            col_stats.min = min(min_val, float(col_stats.min))
+                        except Exception:
+                            try:
+                                col_stats.min = min(min_val, col_stats.min)
+                            except Exception:
+                                col_stats.min = min_val
+
+                    if col_stats.max is None:
+                        col_stats.max = max_val
+                    else:
+                        try:
+                            col_stats.max = max(max_val, float(col_stats.max))
+                        except Exception:
+                            try:
+                                col_stats.max = max(max_val, col_stats.max)
+                            except Exception:
+                                col_stats.max = max_val
+
+                    col_stats.mean_sum += non_null_num.sum()
+                    col_stats.mean_count += non_null_num.count()
 
             elif pd.api.types.is_datetime64_any_dtype(series):
-                min_val = non_null.min()
-                max_val = non_null.max()
-                col_stats.min = str(min(min_val, pd.to_datetime(col_stats.min)) if col_stats.min else min_val)
-                col_stats.max = str(max(max_val, pd.to_datetime(col_stats.max)) if col_stats.max else max_val)
+                # datetime handling
+                try:
+                    dt_series = pd.to_datetime(series, errors='coerce')
+                    non_null_dt = dt_series[dt_series.notna()]
+                    if not non_null_dt.empty:
+                        min_val = non_null_dt.min()
+                        max_val = non_null_dt.max()
+                        if col_stats.min is None:
+                            col_stats.min = min_val
+                        else:
+                            try:
+                                existing = pd.to_datetime(col_stats.min)
+                                col_stats.min = min(min_val, existing)
+                            except Exception:
+                                col_stats.min = min_val
 
-            samples = non_null.astype(str).unique()
+                        if col_stats.max is None:
+                            col_stats.max = max_val
+                        else:
+                            try:
+                                existing = pd.to_datetime(col_stats.max)
+                                col_stats.max = max(max_val, existing)
+                            except Exception:
+                                col_stats.max = max_val
+                except Exception:
+                    pass
+            else:
+                # String-like column: compute alphabetical min/max
+                non_null = series[(series.notna()) & (~series.astype(str).isin(['nan', '', 'NaN']))]
+                if not non_null.empty:
+                    try:
+                        smin = non_null.astype(str).min()
+                        smax = non_null.astype(str).max()
+                        if col_stats.min is None:
+                            col_stats.min = smin
+                        else:
+                            try:
+                                col_stats.min = min(col_stats.min, smin)
+                            except Exception:
+                                col_stats.min = smin
+                        if col_stats.max is None:
+                            col_stats.max = smax
+                        else:
+                            try:
+                                col_stats.max = max(col_stats.max, smax)
+                            except Exception:
+                                col_stats.max = smax
+                    except Exception:
+                        pass
+
+            # For samples, prefer cleaned numeric representation if present, else original non-null strings
+            if numeric_series is not None and numeric_series.notna().any():
+                samples = numeric_series.dropna().astype(str).unique()
+            else:
+                non_null = series[(series.notna()) & (~series.astype(str).isin(['nan', '', 'NaN']))]
+                samples = non_null.astype(str).unique()
+
             col_stats.samples.update(samples[:sample_size])
 
     for col, s in stats.items():
-        avg = f"{s.mean_sum / s.mean_count:.4f}" if s.mean_count else ""
+        avg = f"{s.mean_sum / s.mean_count:.2f}" if s.mean_count else ""
         sample_val = next(iter(s.samples), "")
+
+        # Friendly dtype name and hint for formatting
+        dtype_raw = (s.dtype or "")
+        dtype_hint = None
+
+        # If user provided dtype hints (e.g., leading-zero columns forced to str), respect them
+        if dtype_hints and col in dtype_hints and dtype_hints[col] is str:
+            friendly_dtype = 'str'
+            dtype_hint = 'str'
+        elif s.mean_count > 0:
+            # Numeric column (we collected numeric observations)
+            try:
+                # ensure min/max exist before converting
+                if s.min is None or s.max is None:
+                    raise ValueError("min/max not available")
+                min_f = float(s.min)
+                max_f = float(s.max)
+                avg_f = s.mean_sum / s.mean_count
+                if float(min_f).is_integer() and float(max_f).is_integer() and float(avg_f).is_integer():
+                    friendly_dtype = 'int'
+                    dtype_hint = 'int'
+                else:
+                    friendly_dtype = 'float'
+                    dtype_hint = 'float'
+            except Exception:
+                friendly_dtype = 'float'
+                dtype_hint = 'float'
+        elif 'datetime64' in dtype_raw or (s.min and ('-' in str(s.min) or '/' in str(s.min))):
+            friendly_dtype = 'date'
+            dtype_hint = 'date'
+        else:
+            friendly_dtype = 'str'
+
+        # For integer columns we don't show average as .00 (leave blank)
+        avg_display = "" if dtype_hint == 'int' else avg
 
         row = {
             "Column": truncate(col, header_widths["Column"]),
-            "dtype": (s.dtype or "").ljust(header_widths["dtype"]),
+            "dtype": friendly_dtype.ljust(header_widths["dtype"]),
             "Missing": format_percent(s.missing, s.total).rjust(header_widths["Missing"]),
-            "Minimum": (s.min or "").rjust(header_widths["Minimum"]),
-            "Average": avg.rjust(header_widths["Average"]),
-            "Maximum": (s.max or "").rjust(header_widths["Maximum"]),
-            "Sample": truncate(sample_val, header_widths["Sample"])
+            "Minimum": format_number(s.min, header_widths["Minimum"], dtype_hint=dtype_hint),
+            "Average": format_number(avg_display, header_widths["Average"], dtype_hint=dtype_hint),
+            "Maximum": format_number(s.max, header_widths["Maximum"], dtype_hint=dtype_hint),
+            "Sample": truncate(sample_val, header_widths["Sample"]).rjust(header_widths["Sample"])
         }
 
-        print("".join(row[h] for h in headers))
+        print_table_content(headers, row, header_widths)
+    
+    # Print bottom border
+    print_table_row(headers, header_widths, is_bottom=True)
 
 
-def prompt_drop_columns(reader: Iterator[pd.DataFrame]) -> Callable:
-    # Preview first chunk to get column names
-    first_chunk = next(reader)
+
+def prompt_drop_columns(reader: Iterator[pd.DataFrame]) -> Optional[DropColumnsTransform]:
+    """
+    Ask user which columns to drop and return a DropColumnsTransform.
+    
+    This function CONSUMES the first chunk to get column names, so caller
+    must reload the reader after calling this function.
+    """
+    try:
+        first_chunk = next(reader)
+    except StopIteration:
+        print("No data to preview. Skipping column removal.")
+        return None
+    
     columns = first_chunk.columns.tolist()
 
     # Ask user which columns to drop
@@ -253,29 +750,28 @@ def prompt_drop_columns(reader: Iterator[pd.DataFrame]) -> Callable:
 
     if not to_drop:
         print("No columns selected. Skipping column removal.")
-        return lambda df: df  # identity function
+        return None
 
     print(f"✅ Will drop: {', '.join(to_drop)}")
-
-    # Return transformation function
-    def dropper(chunk: pd.DataFrame) -> pd.DataFrame:
-        return chunk.drop(columns=to_drop, errors='ignore')
-
-    return dropper
+    return DropColumnsTransform(to_drop)
 
 
-def apply_transformations(chunk: pd.DataFrame, transforms: list[Callable[[pd.DataFrame], pd.DataFrame]]) -> pd.DataFrame:
-    for fn in transforms:
-        chunk = fn(chunk)
-    return chunk
-
-def preview_transformed(reader: Iterator[pd.DataFrame], transforms: list[Callable[[pd.DataFrame], pd.DataFrame]]) -> None:
-    row_count = 0
-    for chunk in reader:
-        transformed = apply_transformations(chunk, transforms)
-        preview_full_dataset(iter([transformed]))  # preview just one chunk
-        row_count += len(transformed)
-    input(f" {row_count:,d} rows previewed. Press Enter to continue...")
+def preview_with_transformations(
+    filepath: str, 
+    stack: TransformationStack,
+    sample_size: int = 1,
+    dtype: Optional[dict] = None,
+    parse_dates: Optional[list] = None
+) -> None:
+    """
+    Preview the data with all transformations applied.
+    
+    This demonstrates the key pattern: we reload the file and apply
+    the transformation stack to each chunk as we stream through.
+    """
+    reader = load_file(filepath, dtype=dtype, parse_dates=parse_dates)
+    transformed_reader = stack.apply_to_stream(reader)
+    preview_full_dataset(transformed_reader, sample_size, dtype_hints=dtype)
 
 
 
@@ -291,23 +787,42 @@ def cleany(argument: str="") -> None:
         print("Error: No file selected.")
         sys.exit(1)
 
+    # Auto-detect dtypes for columns with leading zeros and dates
+    print("Scanning file for data type hints...")
+    detected_dtypes, date_cols = detect_leading_zero_columns(file)
+    if detected_dtypes:
+        print(f"Detected text columns (with leading zeros): {list(detected_dtypes.keys())}")
+    if date_cols:
+        print(f"Detected date columns: {date_cols}")
+
+    # Initialize the transformation stack
+    stack = TransformationStack()
+    file_size_print(file)
+
     # Main loop
     looping = True
-    transformations: list[Callable[[pd.DataFrame], pd.DataFrame]] = []
-    reader = load_file(file)
     while looping:
+        print(f"\n{stack.describe()}")
         action = q.select("Select an action:", choices=features + ["Exit"]).ask()
-
 
         if action == "Exit":
             sys.exit(0)
-        elif action == "Preview data (datatypes, sample rows, summary statistics)":
-            preview_full_dataset(reader)
-            reader = load_file(file)
-        elif action == "Remove columns":
-            drop_fn = prompt_drop_columns(reader)
-            reader = load_file(file)  # Reset reader
-            transformations.append(drop_fn)
+        elif action == features[0]: # Preview data
+            preview_with_transformations(file, stack, dtype=detected_dtypes or None, parse_dates=date_cols or None)
+        elif action == "Normalize currency/percent columns":
+            # Add normalization transform to the stack (applies to future streaming reads)
+            confirm = q.confirm("Add NormalizeCurrencyPercentTransform to pipeline? This will convert $ and % values to numeric.", default=True).ask()
+            if confirm:
+                stack.add(NormalizeCurrencyPercentTransform())
+                print("✅ Added NormalizeCurrencyPercentTransform to the pipeline.")
+        # elif action == "Remove columns":
+        #     reader = load_file(file, dtype=detected_dtypes, parse_dates=date_cols)
+        #     transform = prompt_drop_columns(reader)
+        #     if transform:
+        #         stack.add(transform)
+
+
+# endregion
         
 
 
