@@ -48,6 +48,7 @@ features = [
     # "Remove outliers (IQR or Z-score method)",
     # "Save cleaned data to new file or overwrite existing (overwrite is not recommended)",
     # "Can save in different formats (see supported file types above)"
+    "Export transformed file",
 ]
 
 
@@ -774,6 +775,96 @@ def preview_with_transformations(
     preview_full_dataset(transformed_reader, sample_size, dtype_hints=dtype)
 
 
+def export_transformed(
+    filepath: str,
+    stack: TransformationStack,
+    dtype_hints: Optional[dict] = None,
+    parse_dates: Optional[list] = None,
+) -> None:
+    """Export the transformed data to a new file.
+
+    Prompts for output format and filename. Streams CSV/TSV; collects for
+    binary formats (Excel, Parquet, Feather).
+    """
+    # Use the SUPPORTED_FILE_TYPES constant to build the export choices
+    choice_labels = list(SUPPORTED_FILE_TYPES)
+    pick = q.select("Select export format:", choices=choice_labels).ask()
+    if pick is None:
+        print("Export cancelled.")
+        return
+    ext = pick
+
+    base = os.path.splitext(os.path.basename(filepath))[0]
+    default_name = f"{base}_clean"
+    out_name = q.text("Output file name (without extension):", default=default_name).ask()
+    if out_name is None:
+        print("Export cancelled.")
+        return
+    out_name = out_name.strip()
+
+    # If user included a supported extension, strip it off
+    for e in SUPPORTED_FILE_TYPES:
+        if out_name.lower().endswith(e):
+            out_name = out_name[: -len(e)]
+            break
+
+    out_path = os.path.join(os.path.dirname(filepath) or '.', out_name + ext)
+    if os.path.exists(out_path):
+        ok = q.confirm(f"File {out_path} exists. Overwrite?", default=False).ask()
+        if not ok:
+            print("Export cancelled.")
+            return
+
+    reader = load_file(filepath, dtype=dtype_hints, parse_dates=parse_dates)
+    transformed_reader = stack.apply_to_stream(reader)
+
+    print(f"Exporting transformed data to {out_path} ...")
+
+    # Stream-friendly formats: CSV, TSV, JSON (newline-delimited)
+    if ext in ('.csv', '.tsv'):
+        sep = ',' if ext == '.csv' else '\t'
+        first = True
+        for chunk in transformed_reader:
+            if first:
+                chunk.to_csv(out_path, sep=sep, index=False, mode='w', header=True)
+                first = False
+            else:
+                chunk.to_csv(out_path, sep=sep, index=False, mode='a', header=False)
+        print("Export complete.")
+        return
+
+    if ext == '.json':
+        # Write newline-delimited JSON
+        with open(out_path, 'w', encoding='utf-8') as f:
+            for chunk in transformed_reader:
+                chunk.to_json(f, orient='records', lines=True)
+        print("Export complete.")
+        return
+
+    # For binary/batch formats we must collect and then write once
+    parts = []
+    for chunk in transformed_reader:
+        parts.append(chunk)
+    if not parts:
+        print("No data to export.")
+        return
+    df = pd.concat(parts, ignore_index=True)
+
+    try:
+        if ext == '.xlsx' or ext == '.xls':
+            df.to_excel(out_path, index=False)
+        elif ext == '.parquet':
+            df.to_parquet(out_path, index=False)
+        elif ext == '.feather':
+            df.to_feather(out_path)
+        else:
+            # Fallback to CSV
+            df.to_csv(out_path, index=False)
+        print("Export complete.")
+    except Exception as e:
+        print(f"Export failed: {e}")
+
+
 
 
 
@@ -815,6 +906,8 @@ def cleany(argument: str="") -> None:
             if confirm:
                 stack.add(NormalizeCurrencyPercentTransform())
                 print("✅ Added NormalizeCurrencyPercentTransform to the pipeline.")
+        elif action == "Export transformed file":
+            export_transformed(file, stack, dtype_hints=detected_dtypes or None, parse_dates=date_cols or None)
         # elif action == "Remove columns":
         #     reader = load_file(file, dtype=detected_dtypes, parse_dates=date_cols)
         #     transform = prompt_drop_columns(reader)
