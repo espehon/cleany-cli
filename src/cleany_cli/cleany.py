@@ -40,6 +40,8 @@ header_widths = {
 features = [
     "Preview data (datatypes, sample rows, summary statistics)",
     "Normalize currency/percent columns",
+    "Remove columns",
+    "Remove outliers (IQR)",
     # "Rename columns",
     # "Remove columns",
     # "Remove duplicate rows",
@@ -135,6 +137,42 @@ class NormalizeCurrencyPercentTransform(Transform):
         if self.columns:
             return f"Normalize currency/percent in columns: {', '.join(self.columns)}"
         return "Normalize currency/percent in inferred columns"
+
+
+class OutlierRemovalTransform(Transform):
+    """Remove rows with outliers based on per-chunk IQR for specified columns.
+
+    This operates per-chunk (streaming-friendly). For each specified column,
+    it computes Q1/Q3 and removes rows outside [Q1 - k*IQR, Q3 + k*IQR].
+    """
+
+    def __init__(self, columns: list[str], multiplier: float = 1.5):
+        self.columns = columns
+        self.multiplier = float(multiplier)
+
+    def apply(self, chunk: pd.DataFrame) -> pd.DataFrame:
+        if not self.columns:
+            return chunk
+        mask = pd.Series(True, index=chunk.index)
+        for col in self.columns:
+            if col not in chunk.columns:
+                continue
+            # coerce to numeric; non-convertible values become NaN and are preserved
+            num = pd.to_numeric(chunk[col], errors='coerce')
+            if num.dropna().empty:
+                continue
+            q1 = num.quantile(0.25)
+            q3 = num.quantile(0.75)
+            iqr = q3 - q1
+            lower = q1 - self.multiplier * iqr
+            upper = q3 + self.multiplier * iqr
+            # keep NaNs (they are not outliers here)
+            mask &= (num.isna()) | ((num >= lower) & (num <= upper))
+        # return filtered chunk
+        return chunk.loc[mask]
+
+    def describe(self) -> str:
+        return f"Remove outliers (IQR x{self.multiplier}) on: {', '.join(self.columns)}"
 
 
 class TransformationStack:
@@ -368,6 +406,48 @@ def detect_leading_zero_columns(filepath: str, sample_size: int = 1000) -> tuple
                 break  # Found one, no need to check rest of column
     
     return dtype_dict, date_cols
+
+
+def detect_currency_percent_columns(filepath: str, sample_size: int = 1000) -> list[str]:
+    """Scan a small sample of the file and return columns that look like
+    currency or percent (start with '$', end with '%', contain commas, or
+    otherwise look numeric with a percent)."""
+    ext = os.path.splitext(filepath)[-1].lower()
+
+    # Load a sample as strings
+    if ext == '.csv':
+        df_sample = pd.read_csv(filepath, nrows=sample_size, dtype=str)
+    elif ext == '.tsv':
+        df_sample = pd.read_csv(filepath, sep='\t', nrows=sample_size, dtype=str)
+    elif ext in ('.xlsx', '.xls'):
+        df_sample = pd.read_excel(filepath, nrows=sample_size)
+        df_sample = df_sample.astype(str)
+    elif ext in ('.json', '.parquet', '.feather', '.xml'):
+        try:
+            df_sample = pd.read_json(filepath) if ext == '.json' else pd.read_parquet(filepath) if ext == '.parquet' else pd.read_feather(filepath) if ext == '.feather' else pd.read_xml(filepath)
+            df_sample = df_sample.astype(str)
+        except Exception:
+            return []
+    else:
+        return []
+
+    candidates: list[str] = []
+    for col in df_sample.columns:
+        try:
+            s = df_sample[col].astype(str).str.strip()
+        except Exception:
+            continue
+        mask_currency = s.str.startswith('$', na=False)
+        mask_percent = s.str.endswith('%', na=False)
+        mask_commas = s.str.contains(',', na=False)
+        # Only treat as currency/percent-like when there is an explicit marker
+        # such as leading '$', trailing '%', or thousands separators (commas).
+        # Avoid flagging plain numeric columns here to prevent false positives
+        # (e.g., SKU or length columns that are numeric-looking but not currency).
+        if mask_currency.any() or mask_percent.any() or mask_commas.any():
+            candidates.append(col)
+
+    return candidates
 
 
 def load_file(filepath: str, chunksize: int = 10000, dtype: Optional[dict] = None, parse_dates: Optional[list] = None) -> Iterator[pd.DataFrame]:
@@ -757,6 +837,36 @@ def prompt_drop_columns(reader: Iterator[pd.DataFrame]) -> Optional[DropColumnsT
     return DropColumnsTransform(to_drop)
 
 
+def prompt_remove_outliers(reader: Iterator[pd.DataFrame]) -> Optional[OutlierRemovalTransform]:
+    """Prompt user to select numeric columns to remove outliers from, and multiplier."""
+    try:
+        first_chunk = next(reader)
+    except StopIteration:
+        print("No data to preview. Skipping outlier removal.")
+        return None
+
+    # Find numeric columns in the first chunk
+    numeric_cols = first_chunk.select_dtypes(include=['number']).columns.tolist()
+    if not numeric_cols:
+        print("No numeric columns detected in the sample. Skipping outlier removal.")
+        return None
+
+    to_clean = q.checkbox("Select numeric columns to remove outliers from:", choices=numeric_cols).ask()
+    if not to_clean:
+        print("No columns selected. Skipping outlier removal.")
+        return None
+
+    multiplier_txt = q.text("IQR multiplier (default 1.5):", default="1.5").ask()
+    try:
+        mult = float(multiplier_txt)
+    except Exception:
+        print("Invalid multiplier; using 1.5")
+        mult = 1.5
+
+    print(f"✅ Will remove outliers on: {', '.join(to_clean)} with multiplier {mult}")
+    return OutlierRemovalTransform(columns=to_clean, multiplier=mult)
+
+
 def preview_with_transformations(
     filepath: str, 
     stack: TransformationStack,
@@ -890,6 +1000,29 @@ def cleany(argument: str="") -> None:
     stack = TransformationStack()
     file_size_print(file)
 
+    # --- Startup preview + auto-normalization ---
+    # Detect currency/percent-like columns in a small sample. If present,
+    # auto-add NormalizeCurrencyPercentTransform to the stack so the initial
+    # preview reflects the cleaned view (user can remove it later).
+    try:
+        currency_cols = detect_currency_percent_columns(file, sample_size=500)
+        # Exclude any columns that were explicitly hinted as text (leading zeros)
+        if detected_dtypes:
+            currency_cols = [c for c in currency_cols if not (c in detected_dtypes and detected_dtypes[c] is str)]
+
+        if currency_cols:
+            print(f"Detected currency/percent-like columns: {currency_cols}")
+            print("Auto-adding NormalizeCurrencyPercentTransform to pipeline for initial preview.")
+            stack.add(NormalizeCurrencyPercentTransform(columns=currency_cols))
+            print("You can remove this transform later from the pipeline if desired.")
+    except Exception:
+        # If detection fails, continue without auto-adding
+        pass
+
+    # Run an initial preview so user sees the file immediately
+    preview_with_transformations(file, stack, dtype=detected_dtypes or None, parse_dates=date_cols or None)
+    # --- end startup preview ---
+
     # Main loop
     looping = True
     while looping:
@@ -902,10 +1035,32 @@ def cleany(argument: str="") -> None:
             preview_with_transformations(file, stack, dtype=detected_dtypes or None, parse_dates=date_cols or None)
         elif action == "Normalize currency/percent columns":
             # Add normalization transform to the stack (applies to future streaming reads)
+            # Exclude any columns forced to `str` by earlier detection (leading zeros)
+            cols = detect_currency_percent_columns(file, sample_size=500)
+            if detected_dtypes:
+                cols = [c for c in cols if not (c in detected_dtypes and detected_dtypes[c] is str)]
+
             confirm = q.confirm("Add NormalizeCurrencyPercentTransform to pipeline? This will convert $ and % values to numeric.", default=True).ask()
             if confirm:
-                stack.add(NormalizeCurrencyPercentTransform())
-                print("✅ Added NormalizeCurrencyPercentTransform to the pipeline.")
+                if cols:
+                    stack.add(NormalizeCurrencyPercentTransform(columns=cols))
+                    print(f"✅ Added NormalizeCurrencyPercentTransform to the pipeline for columns: {cols}")
+                else:
+                    # No non-forced columns found; add generic transform
+                    stack.add(NormalizeCurrencyPercentTransform())
+                    print("✅ Added NormalizeCurrencyPercentTransform to the pipeline (no specific columns detected).")
+        elif action == "Remove columns":
+            reader = load_file(file, dtype=detected_dtypes or None, parse_dates=date_cols or None)
+            transformed_reader = stack.apply_to_stream(reader)
+            transform = prompt_drop_columns(transformed_reader)
+            if transform:
+                stack.add(transform)
+        elif action == "Remove outliers (IQR)":
+            reader = load_file(file, dtype=detected_dtypes or None, parse_dates=date_cols or None)
+            transformed_reader = stack.apply_to_stream(reader)
+            transform = prompt_remove_outliers(transformed_reader)
+            if transform:
+                stack.add(transform)
         elif action == "Export transformed file":
             export_transformed(file, stack, dtype_hints=detected_dtypes or None, parse_dates=date_cols or None)
         # elif action == "Remove columns":
