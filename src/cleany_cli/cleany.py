@@ -12,10 +12,10 @@ from abc import ABC, abstractmethod
 
 # Third-party imports
 import pandas as pd
-import numpy as np
+# import numpy as np
 
 import questionary as q
-from halo import Halo
+# from halo import Halo
 
 
 # endregion

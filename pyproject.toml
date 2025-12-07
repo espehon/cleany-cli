@@ -15,6 +15,7 @@ requires-python = ">=3.8"
 dependencies = [
   "pandas>=2.0",
   "questionary>=2.0",
+  "openpyxl>=3.0",  # for Excel export support
   "pyarrow>=14.0",  # optional, for fast CSV/Parquet handling
 ]
 
