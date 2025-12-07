@@ -5,6 +5,7 @@
 # Standard library imports
 import sys
 import os
+import random
 from typing import Union, Iterator, Optional, Callable, Any
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -481,7 +482,7 @@ def load_file(filepath: str, chunksize: int = 10000, dtype: Optional[dict] = Non
     return (df[i:i+chunksize] for i in range(0, len(df), chunksize))
 
 
-def format_percent(number, total):
+def format_percent(number: int, total: int) -> str:
     pct = (number / total) * 100 if total else 0
     return f"{pct:6.2f}%"
 
@@ -612,8 +613,19 @@ def preview_full_dataset(data: Iterator[pd.DataFrame], sample_size: int = 1, dty
     print_table_row(headers, header_widths)
 
     stats: dict[str, ColumnStats] = defaultdict(ColumnStats)
+    # For row-based sampling: collect candidate rows with their completeness scores
+    candidate_rows = []  # List of (score, row_index, row_dict) tuples
 
-    for chunk in data:
+    for chunk_idx, chunk in enumerate(data):
+        # Calculate completeness score for each row in this chunk
+        # Score = (non-missing columns) / (total columns)
+        # Higher score = healthier row
+        for row_idx, (_, row) in enumerate(chunk.iterrows()):
+            non_missing = sum(1 for val in row if pd.notna(val) and str(val).strip() != '')
+            score = non_missing / len(chunk.columns)
+            global_row_idx = chunk_idx * len(chunk) + row_idx
+            candidate_rows.append((score, global_row_idx, row.to_dict()))
+        
         for col in chunk.columns:
             series = chunk[col]
             col_stats = stats[col]
@@ -743,21 +755,51 @@ def preview_full_dataset(data: Iterator[pd.DataFrame], sample_size: int = 1, dty
                     except Exception:
                         pass
 
-            # For samples, prefer cleaned numeric representation if present, else original non-null strings
-            if numeric_series is not None and numeric_series.notna().any():
-                samples = numeric_series.dropna().astype(str).unique()
-            else:
-                non_null = series[(series.notna()) & (~series.astype(str).isin(['nan', '', 'NaN']))]
-                samples = non_null.astype(str).unique()
+            # Samples will be populated from row-based selection below
+            # (this placeholder ensures col_stats.samples is initialized)
+            col_stats.samples = set()
 
-            col_stats.samples.update(samples[:sample_size])
-
+    # Select a random row from rows with above-average or perfect completeness
+    sample_row_dict = {}
+    if candidate_rows:
+        # Calculate average completeness score across all rows
+        avg_completeness = sum(score for score, _, _ in candidate_rows) / len(candidate_rows)
+        # Select rows that have 100% completeness OR are at/above average
+        healthy_pool = [(score, idx, row) for score, idx, row in candidate_rows if score >= avg_completeness or score == 1.0]
+        # If no rows meet criteria (shouldn't happen), use all rows
+        if not healthy_pool:
+            healthy_pool = candidate_rows
+        # Randomly select one from the healthy pool
+        selected_score, selected_idx, selected_row = random.choice(healthy_pool)
+        sample_row_dict = selected_row
+    
     for col, s in stats.items():
         avg = f"{s.mean_sum / s.mean_count:.2f}" if s.mean_count else ""
-        sample_val = next(iter(s.samples), "")
-
+        # Get sample value from the selected row and format according to dtype
+        sample_val_raw = sample_row_dict.get(col, "") if sample_row_dict else ""
+        
         # Friendly dtype name and hint for formatting
         dtype_raw = (s.dtype or "")
+
+        # Try to detect if this is a date column from dtype_raw
+        is_date_col = 'datetime64' in dtype_raw
+        
+        # Format date-like samples properly
+        try:
+            if pd.notna(sample_val_raw) and str(sample_val_raw).strip() != '':
+                if is_date_col:
+                    dt = pd.to_datetime(sample_val_raw, errors='coerce')
+                    if pd.notna(dt):
+                        sample_val = dt.strftime('%Y-%m-%d')
+                    else:
+                        sample_val = str(sample_val_raw)
+                else:
+                    sample_val = str(sample_val_raw)
+            else:
+                sample_val = ""
+        except Exception:
+            sample_val = str(sample_val_raw)
+        
         dtype_hint = None
 
         # If user provided dtype hints (e.g., leading-zero columns forced to str), respect them
@@ -773,7 +815,10 @@ def preview_full_dataset(data: Iterator[pd.DataFrame], sample_size: int = 1, dty
                 min_f = float(s.min)
                 max_f = float(s.max)
                 avg_f = s.mean_sum / s.mean_count
-                if float(min_f).is_integer() and float(max_f).is_integer() and float(avg_f).is_integer():
+                # Check if all values are integers, OR if the original dtype was int64/int32/int16/int8
+                is_all_integer = float(min_f).is_integer() and float(max_f).is_integer() and float(avg_f).is_integer()
+                is_int_dtype = 'int' in dtype_raw.lower()
+                if is_all_integer or is_int_dtype:
                     friendly_dtype = 'int'
                     dtype_hint = 'int'
                 else:
@@ -788,15 +833,15 @@ def preview_full_dataset(data: Iterator[pd.DataFrame], sample_size: int = 1, dty
         else:
             friendly_dtype = 'str'
 
-        # For integer columns we don't show average as .00 (leave blank)
-        avg_display = "" if dtype_hint == 'int' else avg
+        # Always show average as float (even for int columns, showing the mean)
+        avg_display = avg
 
         row = {
             "Column": truncate(col, header_widths["Column"]),
             "dtype": friendly_dtype.ljust(header_widths["dtype"]),
             "Missing": format_percent(s.missing, s.total).rjust(header_widths["Missing"]),
             "Minimum": format_number(s.min, header_widths["Minimum"], dtype_hint=dtype_hint),
-            "Average": format_number(avg_display, header_widths["Average"], dtype_hint=dtype_hint),
+            "Average": format_number(avg_display, header_widths["Average"], dtype_hint='float'),  # Always render average as float
             "Maximum": format_number(s.max, header_widths["Maximum"], dtype_hint=dtype_hint),
             "Sample": truncate(sample_val, header_widths["Sample"]).rjust(header_widths["Sample"])
         }
@@ -1063,23 +1108,11 @@ def cleany(argument: str="") -> None:
                 stack.add(transform)
         elif action == "Export transformed file":
             export_transformed(file, stack, dtype_hints=detected_dtypes or None, parse_dates=date_cols or None)
-        # elif action == "Remove columns":
-        #     reader = load_file(file, dtype=detected_dtypes, parse_dates=date_cols)
-        #     transform = prompt_drop_columns(reader)
-        #     if transform:
-        #         stack.add(transform)
-
 
 # endregion
-        
 
 
 
-
-
-
-
-# endregion
 if __name__ == "__main__":
     print("This file should not be run directly\n Please use 'cleany' command in the shell or run __main__.py instead.")
     sys.exit(1)
