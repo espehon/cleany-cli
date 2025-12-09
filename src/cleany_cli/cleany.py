@@ -1026,7 +1026,8 @@ def export_transformed(
 
 # endregion
 # region: Main
-def cleany(argument: str="") -> None:
+def cleany() -> None:
+    argument = str(sys.argv[1:])
     inspect_argument(argument)
     file = find_file(argument)
     if file == "":
