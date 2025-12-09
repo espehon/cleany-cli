@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "cleany-cli"
-version = "0.1.1"
+version = "0.1.2"
 description = "Interactive CLI tool to clean and prune tabular data files"
 authors = [
   { name = "espehon", email = "espehon@gmail.com" }
