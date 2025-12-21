@@ -16,7 +16,7 @@ import pandas as pd
 # import numpy as np
 
 import questionary as q
-# from halo import Halo
+from halo import Halo
 
 
 # endregion
@@ -25,7 +25,8 @@ import questionary as q
 SUPPORTED_FILE_TYPES = ('.csv', '.xlsx', '.xls', '.json', '.parquet', '.feather', '.xml')
 
 FILE_SIZE_LIMIT = 1024 * 1024 * 1024    # 1 GB
-CHUNK_SIZE = 100000                     # 100k rows per chunk for large files
+CHUNK_SIZE = 100_000                     # 100k rows per chunk for large files
+MAX_PREVIEW_ROWS = 10_000               # number of rows to scan for short previews
 STREAMABLE = {'.csv', '.tsv',}
 
 header_widths = {
@@ -39,6 +40,7 @@ header_widths = {
 }
 
 features = [
+    "Sample data",
     "Preview data (datatypes, sample rows, summary statistics)",
     "Normalize currency/percent columns",
     "Remove columns",
@@ -280,6 +282,41 @@ def inspect_argument(arg: str) -> None:
     else:
         return
 
+def get_row_count(filepath: str) -> Optional[int]:
+    """Return a best-effort row count for common file types. Returns None on failure."""
+    ext = os.path.splitext(filepath)[-1].lower()
+    try:
+        if ext in ('.csv', '.tsv'):
+            sep = '\t' if ext == '.tsv' else ','
+            # Count non-empty lines; assume header exists and subtract 1 when >0
+            with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
+                count = sum(1 for _ in f)
+            if count > 0:
+                return max(0, count - 1)
+            return 0
+        elif ext in ('.xlsx', '.xls'):
+            df = pd.read_excel(filepath, nrows=1)
+            # Use pandas to read full file size (may be slow) but we can use sheet metadata if needed
+            df_full = pd.read_excel(filepath)
+            return len(df_full)
+        elif ext == '.json':
+            # try newline-delimited JSON first
+            try:
+                with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
+                    return sum(1 for _ in f)
+            except Exception:
+                df = pd.read_json(filepath)
+                return len(df)
+        elif ext in ('.parquet', '.feather'):
+            df = pd.read_parquet(filepath) if ext == '.parquet' else pd.read_feather(filepath)
+            return len(df)
+        elif ext == '.xml':
+            df = pd.read_xml(filepath)
+            return len(df)
+    except Exception:
+        return None
+
+
 def file_size_print(filepath: str) -> None:
     size = os.path.getsize(filepath)
     if size < 1024:
@@ -290,6 +327,11 @@ def file_size_print(filepath: str) -> None:
         print(f"File size: {size / (1024 * 1024):.2f} MB")
     else:
         print(f"File size: {size / (1024 * 1024 * 1024):.2f} GB")
+
+    # Bonus: try to print total row count (best-effort; may take time for large files)
+    rc = get_row_count(filepath)
+    if rc is not None:
+        print(f"Row count: {rc:,}")
 
 
 def get_file_list() -> list:
@@ -486,6 +528,52 @@ def format_percent(number: int, total: int) -> str:
     pct = (number / total) * 100 if total else 0
     return f"{pct:6.2f}%"
 
+
+def iterate_with_progress(iterator: Iterator[pd.DataFrame], total_rows: Optional[int] = None, spinner_text: str = "Processing", spinner: Optional[Halo] = None) -> Iterator[pd.DataFrame]:
+    """Wrap an iterator of DataFrame chunks with a Halo spinner that updates
+    the text with rows processed and percent complete (if total_rows is given).
+
+    If an external spinner is provided, it will be used and not auto-started here;
+    otherwise a local spinner is created and started.
+
+    Yields the same chunks as the original iterator while updating the spinner.
+    """
+    created_local_spinner = False
+    if spinner is None:
+        spinner = Halo(text=spinner_text, spinner='dots')
+        spinner.start()
+        created_local_spinner = True
+    rows = 0
+    try:
+        for chunk in iterator:
+            yield chunk
+            try:
+                rows += len(chunk)
+            except Exception:
+                rows += 0
+            if total_rows:
+                pct = min(100.0, (rows / total_rows) * 100.0) if total_rows else 0.0
+                spinner.text = f"{spinner_text} — {rows:,}/{total_rows:,} ({pct:.1f}%)"
+            else:
+                spinner.text = f"{spinner_text} — processed {rows:,} rows"
+        # If we created the spinner locally, finish it; otherwise just update text
+        if created_local_spinner:
+            spinner.succeed(f"{spinner_text} — done ({rows:,} rows)")
+        else:
+            try:
+                spinner.text = f"{spinner_text} — done ({rows:,} rows)"
+            except Exception:
+                pass
+    except Exception as exc:
+        if created_local_spinner:
+            spinner.fail(f"{spinner_text} failed: {exc}")
+        else:
+            try:
+                spinner.fail(f"{spinner_text} failed: {exc}")
+            except Exception:
+                pass
+        raise
+
 def format_number(value: Optional[Any], width: int, dtype_hint: Optional[str] = None) -> str:
     """
     Format a value for display according to dtype_hint.
@@ -599,22 +687,49 @@ def print_table_content(columns: list[str], values: dict[str, str], widths: dict
         parts.append("│")
     print("".join(parts))
 
-def preview_full_dataset(data: Iterator[pd.DataFrame], sample_size: int = 1, dtype_hints: Optional[dict] = None) -> None:
+def preview_full_dataset(data: Iterator[pd.DataFrame], sample_size: int = 1, dtype_hints: Optional[dict] = None, full_summary: bool = False, max_preview_rows: int = MAX_PREVIEW_ROWS, sample_rows: int = 4, spinner: Optional[Halo] = None, total_rows: Optional[int] = None) -> None:
+    """Preview the dataset.
+
+    By default (full_summary=False) this function scans at most `max_preview_rows`
+    to determine dtypes and missing rates and prints a short summary (no
+    min/max/average). It also prints up to `sample_rows` example rows selected
+    from rows whose completeness is at or above the average completeness.
+
+    If full_summary=True, behavior is unchanged: min/max/average are computed
+    across the entire dataset (may be slower for large files).
+    """
+
     headers = list(header_widths.keys())
     
-    # Print top border
-    print_table_row(headers, header_widths, is_header=True)
-    
-    # Print header row
-    header_row = {h: h.ljust(header_widths[h]) for h in headers}
-    print_table_content(headers, header_row, header_widths)
-    
-    # Print header separator
-    print_table_row(headers, header_widths)
+    # In short-summary mode, print header immediately for quick feedback
+    if not full_summary:
+        # Print top border
+        print_table_row(headers, header_widths, is_header=True)
+        
+        # Print header row (use Sample labels in short-summary mode)
+        header_row = {}
+        for h in headers:
+            label = h
+            if h == "Minimum":
+                label = "Sample 1"
+            elif h == "Average":
+                label = "Sample 2"
+            elif h == "Maximum":
+                label = "Sample 3"
+            elif h == "Sample":
+                label = "Sample 4"
+            header_row[h] = label.ljust(header_widths[h])
+        print_table_content(headers, header_row, header_widths)
+        # Print header separator
+        print_table_row(headers, header_widths)    
 
     stats: dict[str, ColumnStats] = defaultdict(ColumnStats)
     # For row-based sampling: collect candidate rows with their completeness scores
     candidate_rows = []  # List of (score, row_index, row_dict) tuples
+
+    rows_seen = 0
+    sample_row_limit = sample_rows
+    sample_rows_collected = 0
 
     for chunk_idx, chunk in enumerate(data):
         # Calculate completeness score for each row in this chunk
@@ -670,136 +785,224 @@ def preview_full_dataset(data: Iterator[pd.DataFrame], sample_size: int = 1, dty
             if dtype_hints and col in dtype_hints and dtype_hints[col] is str:
                 numeric_series = None
 
-            # If the column is numeric-like (either inferred dtype or cleaned numeric has values), use numeric_series
+            # If the column is numeric-like (either inferred dtype or cleaned numeric has values), we may compute stats
             if pd.api.types.is_numeric_dtype(series) or (numeric_series is not None and numeric_series.notna().any()):
-                # Prefer numeric_series if available (handles $ and % normalization)
-                use_numeric = numeric_series if numeric_series is not None else pd.to_numeric(series, errors='coerce')
-                non_null_num = use_numeric[use_numeric.notna()]
-                if not non_null_num.empty:
-                    min_val = non_null_num.min()
-                    max_val = non_null_num.max()
-                    # Store native numeric min/max values
-                    if col_stats.min is None:
-                        col_stats.min = min_val
-                    else:
-                        try:
-                            col_stats.min = min(min_val, float(col_stats.min))
-                        except Exception:
-                            try:
-                                col_stats.min = min(min_val, col_stats.min)
-                            except Exception:
-                                col_stats.min = min_val
-
-                    if col_stats.max is None:
-                        col_stats.max = max_val
-                    else:
-                        try:
-                            col_stats.max = max(max_val, float(col_stats.max))
-                        except Exception:
-                            try:
-                                col_stats.max = max(max_val, col_stats.max)
-                            except Exception:
-                                col_stats.max = max_val
-
-                    col_stats.mean_sum += non_null_num.sum()
-                    col_stats.mean_count += non_null_num.count()
-
-            elif pd.api.types.is_datetime64_any_dtype(series):
-                # datetime handling
-                try:
-                    dt_series = pd.to_datetime(series, errors='coerce')
-                    non_null_dt = dt_series[dt_series.notna()]
-                    if not non_null_dt.empty:
-                        min_val = non_null_dt.min()
-                        max_val = non_null_dt.max()
+                if full_summary:
+                    # Prefer numeric_series if available (handles $ and % normalization)
+                    use_numeric = numeric_series if numeric_series is not None else pd.to_numeric(series, errors='coerce')
+                    non_null_num = use_numeric[use_numeric.notna()]
+                    if not non_null_num.empty:
+                        min_val = non_null_num.min()
+                        max_val = non_null_num.max()
+                        # Store native numeric min/max values
                         if col_stats.min is None:
                             col_stats.min = min_val
                         else:
                             try:
-                                existing = pd.to_datetime(col_stats.min)
-                                col_stats.min = min(min_val, existing)
+                                col_stats.min = min(min_val, float(col_stats.min))
                             except Exception:
-                                col_stats.min = min_val
+                                try:
+                                    col_stats.min = min(min_val, col_stats.min)
+                                except Exception:
+                                    col_stats.min = min_val
 
                         if col_stats.max is None:
                             col_stats.max = max_val
                         else:
                             try:
-                                existing = pd.to_datetime(col_stats.max)
-                                col_stats.max = max(max_val, existing)
+                                col_stats.max = max(max_val, float(col_stats.max))
                             except Exception:
-                                col_stats.max = max_val
-                except Exception:
-                    pass
-            else:
-                # String-like column: compute alphabetical min/max
-                non_null = series[(series.notna()) & (~series.astype(str).isin(['nan', '', 'NaN']))]
-                if not non_null.empty:
+                                try:
+                                    col_stats.max = max(max_val, col_stats.max)
+                                except Exception:
+                                    col_stats.max = max_val
+
+                        col_stats.mean_sum += non_null_num.sum()
+                        col_stats.mean_count += non_null_num.count()
+                else:
+                    # Short summary: detect numeric-like presence so we can infer dtype
                     try:
-                        smin = non_null.astype(str).min()
-                        smax = non_null.astype(str).max()
-                        if col_stats.min is None:
-                            col_stats.min = smin
-                        else:
-                            try:
-                                col_stats.min = min(col_stats.min, smin)
-                            except Exception:
-                                col_stats.min = smin
-                        if col_stats.max is None:
-                            col_stats.max = smax
-                        else:
-                            try:
-                                col_stats.max = max(col_stats.max, smax)
-                            except Exception:
-                                col_stats.max = smax
+                        use_numeric = numeric_series if numeric_series is not None else pd.to_numeric(series, errors='coerce')
+                        non_null_num = use_numeric[use_numeric.notna()]
+                        if not non_null_num.empty:
+                            # Update mean counters so later dtype inference sees numeric activity
+                            col_stats.mean_sum += non_null_num.sum()
+                            col_stats.mean_count += non_null_num.count()
                     except Exception:
                         pass
+
+            elif pd.api.types.is_datetime64_any_dtype(series):
+                # datetime handling (only computed in full summary mode)
+                if full_summary:
+                    try:
+                        dt_series = pd.to_datetime(series, errors='coerce')
+                        non_null_dt = dt_series[dt_series.notna()]
+                        if not non_null_dt.empty:
+                            min_val = non_null_dt.min()
+                            max_val = non_null_dt.max()
+                            if col_stats.min is None:
+                                col_stats.min = min_val
+                            else:
+                                try:
+                                    existing = pd.to_datetime(col_stats.min)
+                                    col_stats.min = min(min_val, existing)
+                                except Exception:
+                                    col_stats.min = min_val
+
+                            if col_stats.max is None:
+                                col_stats.max = max_val
+                            else:
+                                try:
+                                    existing = pd.to_datetime(col_stats.max)
+                                    col_stats.max = max(max_val, existing)
+                                except Exception:
+                                    col_stats.max = max_val
+                    except Exception:
+                        pass
+                else:
+                    # Short mode: detect date-like presence for dtype inference
+                    try:
+                        dt_series = pd.to_datetime(series, errors='coerce')
+                        if dt_series.notna().any():
+                            # record a sample datetime to help friendly dtype inference
+                            if col_stats.min is None and not dt_series.dropna().empty:
+                                col_stats.min = dt_series.dropna().iloc[0]
+                            col_stats.dtype = 'datetime64[ns]'
+                    except Exception:
+                        pass
+            else:
+                # String-like column: compute alphabetical min/max (full summary only)
+                if full_summary:
+                    non_null = series[(series.notna()) & (~series.astype(str).isin(['nan', '', 'NaN']))]
+                    if not non_null.empty:
+                        try:
+                            smin = non_null.astype(str).min()
+                            smax = non_null.astype(str).max()
+                            if col_stats.min is None:
+                                col_stats.min = smin
+                            else:
+                                try:
+                                    col_stats.min = min(col_stats.min, smin)
+                                except Exception:
+                                    col_stats.min = smin
+                            if col_stats.max is None:
+                                col_stats.max = smax
+                            else:
+                                try:
+                                    col_stats.max = max(col_stats.max, smax)
+                                except Exception:
+                                    col_stats.max = smax
+                        except Exception:
+                            pass
+                else:
+                    # Short mode: skip alphabetical min/max
+                    pass
 
             # Samples will be populated from row-based selection below
             # (this placeholder ensures col_stats.samples is initialized)
             col_stats.samples = set()
 
+        # Update rows seen (by chunk) and optionally stop early in short mode
+        rows_seen += len(chunk)
+        if not full_summary and rows_seen >= max_preview_rows:
+            break
+
     # Select a random row from rows with above-average or perfect completeness
+    # Choose sample rows from healthy candidates using normalized completeness
     sample_row_dict = {}
+    sample_rows_list: list[dict] = []
     if candidate_rows:
         # Calculate average completeness score across all rows
         avg_completeness = sum(score for score, _, _ in candidate_rows) / len(candidate_rows)
         # Select rows that have 100% completeness OR are at/above average
         healthy_pool = [(score, idx, row) for score, idx, row in candidate_rows if score >= avg_completeness or score == 1.0]
-        # If no rows meet criteria (shouldn't happen), use all rows
+        # If no rows meet criteria, use all rows
         if not healthy_pool:
             healthy_pool = candidate_rows
-        # Randomly select one from the healthy pool
-        selected_score, selected_idx, selected_row = random.choice(healthy_pool)
-        sample_row_dict = selected_row
+        # In short mode, pick up to `sample_rows` distinct rows from the healthy pool
+        if not full_summary:
+            k = min(sample_row_limit, len(healthy_pool))
+            sampled = random.sample(healthy_pool, k)
+            sample_rows_list = [row for (_s, _i, row) in sampled]
+            if sample_rows_list:
+                sample_row_dict = sample_rows_list[0]
+        else:
+            # Full summary behavior: single random sample as before
+            selected_score, selected_idx, selected_row = random.choice(healthy_pool)
+            sample_row_dict = selected_row
     
+    # Prepare samples_for_table: four sample rows used for Min/Average/Max/Sample columns in short mode
+    samples_for_table: list[dict] = []
+    if not full_summary and sample_rows_list:
+        L = len(sample_rows_list)
+        samples_for_table = [sample_rows_list[i % L] for i in range(4)]
+
+    # If running a full summary, finish the spinner now and print the header once
+    if full_summary:
+        if spinner:
+            try:
+                spinner.succeed(f"Computing full summary — done ({rows_seen:,} rows)")
+            except Exception:
+                pass
+
+        # Print header now that processing is complete
+        print_table_row(headers, header_widths, is_header=True)
+        header_row = {}
+        for h in headers:
+            label = h
+            if not full_summary:
+                if h == "Minimum":
+                    label = "Sample 1"
+                elif h == "Average":
+                    label = "Sample 2"
+                elif h == "Maximum":
+                    label = "Sample 3"
+                elif h == "Sample":
+                    label = "Sample 4"
+            header_row[h] = label.ljust(header_widths[h])
+        print_table_content(headers, header_row, header_widths)
+        # Print header separator
+        print_table_row(headers, header_widths)
+
     for col, s in stats.items():
         avg = f"{s.mean_sum / s.mean_count:.2f}" if s.mean_count else ""
-        # Get sample value from the selected row and format according to dtype
-        sample_val_raw = sample_row_dict.get(col, "") if sample_row_dict else ""
-        
+
+        # Determine sample raw values depending on full vs short summary
+        if not full_summary and samples_for_table:
+            min_sample_raw = samples_for_table[0].get(col, None)
+            avg_sample_raw = samples_for_table[1].get(col, "")
+            max_sample_raw = samples_for_table[2].get(col, None)
+            sample_val_raw = samples_for_table[3].get(col, "")
+        else:
+            # Full summary: sample_val comes from the single random sample_row_dict
+            min_sample_raw = None
+            avg_sample_raw = ""
+            max_sample_raw = None
+            sample_val_raw = sample_row_dict.get(col, "") if sample_row_dict else ""
+
         # Friendly dtype name and hint for formatting
         dtype_raw = (s.dtype or "")
 
         # Try to detect if this is a date column from dtype_raw
         is_date_col = 'datetime64' in dtype_raw
-        
-        # Format date-like samples properly
-        try:
-            if pd.notna(sample_val_raw) and str(sample_val_raw).strip() != '':
-                if is_date_col:
-                    dt = pd.to_datetime(sample_val_raw, errors='coerce')
-                    if pd.notna(dt):
-                        sample_val = dt.strftime('%Y-%m-%d')
-                    else:
-                        sample_val = str(sample_val_raw)
-                else:
-                    sample_val = str(sample_val_raw)
-            else:
-                sample_val = ""
-        except Exception:
-            sample_val = str(sample_val_raw)
-        
+
+        # Format sample values (date formatting for readability)
+        def format_sample_value(val):
+            try:
+                if pd.notna(val) and str(val).strip() != '':
+                    if is_date_col:
+                        dv = pd.to_datetime(val, errors='coerce')
+                        return dv.strftime('%Y-%m-%d') if pd.notna(dv) else str(val)
+                    return str(val)
+                return ""
+            except Exception:
+                return str(val)
+
+        sample_val = format_sample_value(sample_val_raw)
+        min_sample_display = format_sample_value(min_sample_raw) if min_sample_raw is not None else None
+        avg_sample_display = format_sample_value(avg_sample_raw) if avg_sample_raw != "" else ""
+        max_sample_display = format_sample_value(max_sample_raw) if max_sample_raw is not None else None
+
         dtype_hint = None
 
         # If user provided dtype hints (e.g., leading-zero columns forced to str), respect them
@@ -833,16 +1036,25 @@ def preview_full_dataset(data: Iterator[pd.DataFrame], sample_size: int = 1, dty
         else:
             friendly_dtype = 'str'
 
-        # Always show average as float (even for int columns, showing the mean)
-        avg_display = avg
+        # Prepare displays depending on full vs short summary
+        if full_summary:
+            # Always show average as float (even for int columns, showing the mean)
+            avg_display = avg
+            min_display = s.min
+            max_display = s.max
+        else:
+            # Short summary: replace min/avg/max with sample values
+            avg_display = avg_sample_display
+            min_display = min_sample_display
+            max_display = max_sample_display
 
         row = {
             "Column": truncate(col, header_widths["Column"]),
             "dtype": friendly_dtype.ljust(header_widths["dtype"]),
             "Missing": format_percent(s.missing, s.total).rjust(header_widths["Missing"]),
-            "Minimum": format_number(s.min, header_widths["Minimum"], dtype_hint=dtype_hint),
-            "Average": format_number(avg_display, header_widths["Average"], dtype_hint='float'),  # Always render average as float
-            "Maximum": format_number(s.max, header_widths["Maximum"], dtype_hint=dtype_hint),
+            "Minimum": format_number(min_display, header_widths["Minimum"], dtype_hint=dtype_hint),
+            "Average": format_number(avg_display, header_widths["Average"], dtype_hint=('float' if full_summary else dtype_hint)),
+            "Maximum": format_number(max_display, header_widths["Maximum"], dtype_hint=dtype_hint),
             "Sample": truncate(sample_val, header_widths["Sample"]).rjust(header_widths["Sample"])
         }
 
@@ -850,6 +1062,13 @@ def preview_full_dataset(data: Iterator[pd.DataFrame], sample_size: int = 1, dty
     
     # Print bottom border
     print_table_row(headers, header_widths, is_bottom=True)
+
+    # Rows processed summary (short: up to max_preview_rows; full: total rows processed)
+    print(f"Rows processed: {rows_seen:,}")
+
+
+
+
 
 
 
@@ -917,17 +1136,29 @@ def preview_with_transformations(
     stack: TransformationStack,
     sample_size: int = 1,
     dtype: Optional[dict] = None,
-    parse_dates: Optional[list] = None
+    parse_dates: Optional[list] = None,
+    full_summary: bool = False,
 ) -> None:
     """
     Preview the data with all transformations applied.
-    
-    This demonstrates the key pattern: we reload the file and apply
-    the transformation stack to each chunk as we stream through.
+
+    If `full_summary` is False (default), the preview scans only the first
+    10k rows and prints a short summary with sample rows. If True, it will
+    compute min/max/average across the entire dataset (may be slow).
     """
     reader = load_file(filepath, dtype=dtype, parse_dates=parse_dates)
     transformed_reader = stack.apply_to_stream(reader)
-    preview_full_dataset(transformed_reader, sample_size, dtype_hints=dtype)
+    spinner = None
+    total_rows = None
+    if full_summary:
+        total_rows = get_row_count(filepath)
+        spinner = Halo(text="Computing full summary", spinner='dots')
+        try:
+            spinner.start()
+        except Exception:
+            pass
+        transformed_reader = iterate_with_progress(transformed_reader, total_rows=total_rows, spinner_text="Computing full summary", spinner=spinner)
+    preview_full_dataset(transformed_reader, sample_size, dtype_hints=dtype, full_summary=full_summary, spinner=spinner, total_rows=total_rows)
 
 
 def export_transformed(
@@ -976,10 +1207,11 @@ def export_transformed(
     print(f"Exporting transformed data to {out_path} ...")
 
     # Stream-friendly formats: CSV, TSV, JSON (newline-delimited)
+    total_rows = get_row_count(filepath)
     if ext in ('.csv', '.tsv'):
         sep = ',' if ext == '.csv' else '\t'
         first = True
-        for chunk in transformed_reader:
+        for chunk in iterate_with_progress(transformed_reader, total_rows=total_rows, spinner_text=f"Exporting to {ext}"):
             if first:
                 chunk.to_csv(out_path, sep=sep, index=False, mode='w', header=True)
                 first = False
@@ -991,14 +1223,14 @@ def export_transformed(
     if ext == '.json':
         # Write newline-delimited JSON
         with open(out_path, 'w', encoding='utf-8') as f:
-            for chunk in transformed_reader:
+            for chunk in iterate_with_progress(transformed_reader, total_rows=total_rows, spinner_text=f"Exporting to {ext}"):
                 chunk.to_json(f, orient='records', lines=True)
         print("Export complete.")
         return
 
     # For binary/batch formats we must collect and then write once
     parts = []
-    for chunk in transformed_reader:
+    for chunk in iterate_with_progress(transformed_reader, total_rows=total_rows, spinner_text="Collecting chunks for export"):
         parts.append(chunk)
     if not parts:
         print("No data to export.")
@@ -1027,7 +1259,7 @@ def export_transformed(
 # endregion
 # region: Main
 def cleany() -> None:
-    argument = str(sys.argv[1:])
+    argument = str(sys.argv[1])
     inspect_argument(argument)
     file = find_file(argument)
     if file == "":
@@ -1035,8 +1267,16 @@ def cleany() -> None:
         sys.exit(1)
 
     # Auto-detect dtypes for columns with leading zeros and dates
-    print("Scanning file for data type hints...")
-    detected_dtypes, date_cols = detect_leading_zero_columns(file)
+    spinner = Halo(text="Scanning file for data type hints...", spinner='dots')
+    try:
+        spinner.start()
+        detected_dtypes, date_cols = detect_leading_zero_columns(file)
+        spinner.succeed("Done scanning file for data type hints.")
+    except Exception as exc:
+        spinner.fail(f"Scanning file for data type hints failed: {exc}")
+        # Fall back to empty hints on failure
+        detected_dtypes, date_cols = {}, []
+
     if detected_dtypes:
         print(f"Detected text columns (with leading zeros): {list(detected_dtypes.keys())}")
     if date_cols:
@@ -1077,8 +1317,13 @@ def cleany() -> None:
 
         if action == "Exit":
             sys.exit(0)
-        elif action == features[0]: # Preview data
-            preview_with_transformations(file, stack, dtype=detected_dtypes or None, parse_dates=date_cols or None)
+        elif action == features[0]: # Sample data
+            preview_with_transformations(file, stack, dtype=detected_dtypes or None, parse_dates=date_cols or None, full_summary=False)
+
+        elif action == features[1]: # Preview data
+            full = q.confirm("Compute full summary (min/max/avg) — this may be slow. Run full summary?", default=False).ask()
+            if full:
+                preview_with_transformations(file, stack, dtype=detected_dtypes or None, parse_dates=date_cols or None, full_summary=True)
         elif action == "Normalize currency/percent columns":
             # Add normalization transform to the stack (applies to future streaming reads)
             # Exclude any columns forced to `str` by earlier detection (leading zeros)
