@@ -47,6 +47,7 @@ features = [
     "Normalize currency/percent columns",
     "Remove columns",
     "Remove outliers (IQR)",
+    "Remove transformation",
     # "Rename columns",
     # "Remove columns",
     # "Remove duplicate rows",
@@ -631,42 +632,35 @@ def truncate(text, width):
     text = str(text)
     return text[: width - 1] + '…' if len(text) > width else text
 
-def print_table_row(columns: list[str], widths: dict[str, int], is_header: bool = False, is_bottom: bool = False) -> None:
-    """Print a row of the table with box characters and column separators."""
+def format_table_row(columns: list[str], widths: dict[str, int], is_header: bool = False, is_bottom: bool = False) -> str:
+    """Return a table border/separator row as a string (does not print)."""
     if is_header:
-        # Header: use box-drawing characters
         left = "┌"
         mid = "┬"
         right = "┐"
         sep = "─"
     elif is_bottom:
-        # Bottom border
         left = "└"
         mid = "┴"
         right = "┘"
         sep = "─"
     else:
-        # Data row separator
         left = "├"
         mid = "┼"
         right = "┤"
         sep = "─"
-    
+
     parts = [left]
     for i, col in enumerate(columns):
         parts.append(sep * widths[col])
         if i < len(columns) - 1:
             parts.append(mid)
     parts.append(right)
-    print("".join(parts))
+    return "".join(parts)
 
-def print_table_content(columns: list[str], values: dict[str, str], widths: dict[str, int]) -> None:
-    """Print a data row with vertical separators.
 
-    Pads each column to its configured width. Alignment is column-specific:
-    - left for `Column` and `dtype`
-    - right for numeric columns and `Sample`
-    """
+def format_table_content(columns: list[str], values: dict[str, str], widths: dict[str, int]) -> str:
+    """Return a formatted table content row as a string (does not print)."""
     alignments = {
         "Column": "left",
         "dtype": "left",
@@ -687,7 +681,22 @@ def print_table_content(columns: list[str], values: dict[str, str], widths: dict
             padded = str(raw)[:w].ljust(w)
         parts.append(padded)
         parts.append("│")
-    print("".join(parts))
+    return "".join(parts)
+
+
+def print_table_row(columns: list[str], widths: dict[str, int], is_header: bool = False, is_bottom: bool = False) -> None:
+    """Print a row of the table with box characters and column separators."""
+    print(format_table_row(columns, widths, is_header=is_header, is_bottom=is_bottom))
+
+
+def print_table_content(columns: list[str], values: dict[str, str], widths: dict[str, int]) -> None:
+    """Print a data row with vertical separators.
+
+    Pads each column to its configured width. Alignment is column-specific:
+    - left for `Column` and `dtype`
+    - right for numeric columns and `Sample`
+    """
+    print(format_table_content(columns, values, widths))
 
 def preview_full_dataset(data: Iterator[pd.DataFrame], sample_size: int = 1, dtype_hints: Optional[dict] = None, full_summary: bool = False, max_preview_rows: int = MAX_PREVIEW_ROWS, sample_rows: int = 4, spinner: Optional[Halo] = None, total_rows: Optional[int] = None) -> None:
     """Preview the dataset.
@@ -703,12 +712,11 @@ def preview_full_dataset(data: Iterator[pd.DataFrame], sample_size: int = 1, dty
 
     headers = list(header_widths.keys())
     
-    # In short-summary mode, print header immediately for quick feedback
+    # In short-summary mode, buffer header so spinner output doesn't interleave
+    buffer_lines: list[str] = []
     if not full_summary:
-        # Print top border
-        print_table_row(headers, header_widths, is_header=True)
-        
-        # Print header row (use Sample labels in short-summary mode)
+        buffer_lines.append(format_table_row(headers, header_widths, is_header=True))
+        # Build header row (use Sample labels in short-summary mode)
         header_row = {}
         for h in headers:
             label = h
@@ -721,9 +729,8 @@ def preview_full_dataset(data: Iterator[pd.DataFrame], sample_size: int = 1, dty
             elif h == "Sample":
                 label = "Sample 4"
             header_row[h] = label.ljust(header_widths[h])
-        print_table_content(headers, header_row, header_widths)
-        # Print header separator
-        print_table_row(headers, header_widths)    
+        buffer_lines.append(format_table_content(headers, header_row, header_widths))
+        buffer_lines.append(format_table_row(headers, header_widths))
 
     stats: dict[str, ColumnStats] = defaultdict(ColumnStats)
     # For row-based sampling: collect candidate rows with their completeness scores
@@ -1060,10 +1067,24 @@ def preview_full_dataset(data: Iterator[pd.DataFrame], sample_size: int = 1, dty
             "Sample": truncate(sample_val, header_widths["Sample"]).rjust(header_widths["Sample"])
         }
 
-        print_table_content(headers, row, header_widths)
+        row_line = format_table_content(headers, row, header_widths)
+        if full_summary:
+            print(row_line)
+        else:
+            buffer_lines.append(row_line)
     
-    # Print bottom border
-    print_table_row(headers, header_widths, is_bottom=True)
+    # Print bottom border and flush buffered content for short-summary mode
+    if not full_summary:
+        buffer_lines.append(format_table_row(headers, header_widths, is_bottom=True))
+        if spinner:
+            try:
+                spinner.succeed(f"Sampling summary — done ({rows_seen:,} rows)")
+            except Exception:
+                pass
+        for line in buffer_lines:
+            print(line)
+    else:
+        print_table_row(headers, header_widths, is_bottom=True)
 
     # Rows processed summary (short: up to max_preview_rows; full: total rows processed)
     print(f"Rows processed: {rows_seen:,}")
@@ -1099,7 +1120,7 @@ def prompt_drop_columns(reader: Iterator[pd.DataFrame]) -> Optional[DropColumnsT
         print("No columns selected. Skipping column removal.")
         return None
 
-    spinner.succeed("Will drop: {', '.join(to_drop)}")
+    spinner.succeed(f"Will drop: {', '.join(to_drop)}")
     return DropColumnsTransform(to_drop)
 
 
@@ -1129,8 +1150,45 @@ def prompt_remove_outliers(reader: Iterator[pd.DataFrame]) -> Optional[OutlierRe
         print("Invalid multiplier; using 1.5")
         mult = 1.5
 
-    spinner.succeed("Will remove outliers on: {', '.join(to_clean)} with multiplier {mult}")
+    spinner.succeed(f"Will remove outliers on: {', '.join(to_clean)} with multiplier {mult}")
     return OutlierRemovalTransform(columns=to_clean, multiplier=mult)
+
+
+def prompt_remove_transforms(stack: TransformationStack) -> Optional[list[Transform]]:
+    """Prompt the user to select one or more transforms to remove from the stack.
+
+    Returns a list of removed transforms, or None if nothing was removed.
+    """
+    if not stack.transforms:
+        print("No transformations in the pipeline to remove.")
+        return None
+
+    titles = [f"{i+1}. {t.describe()}" for i, t in enumerate(stack.transforms)]
+    selected = q.checkbox("Select transforms to remove (checked):", choices=titles).ask()
+    if not selected:
+        print("No transforms selected. No changes made.")
+        return None
+
+    # Parse indices and remove in reverse order to avoid shifting
+    try:
+        indices = sorted([int(s.split('.', 1)[0]) - 1 for s in selected], reverse=True)
+    except Exception:
+        print("Could not parse selection. No changes made.")
+        return None
+
+    removed: list[Transform] = []
+    for idx in indices:
+        try:
+            removed.append(stack.transforms.pop(idx))
+        except Exception:
+            continue
+
+    if removed:
+        spinner.succeed(f"Removed {len(removed)} transform(s): {', '.join(r.describe() for r in removed)}")
+        return removed
+
+    print("No transforms were removed.")
+    return None
 
 
 def preview_with_transformations(
@@ -1150,16 +1208,13 @@ def preview_with_transformations(
     """
     reader = load_file(filepath, dtype=dtype, parse_dates=parse_dates)
     transformed_reader = stack.apply_to_stream(reader)
-    spinner = None
     total_rows = None
     if full_summary:
         total_rows = get_row_count(filepath)
-        spinner = Halo(text="Computing full summary", spinner='dots')
-        try:
-            spinner.start()
-        except Exception:
-            pass
+        spinner.start("Computing full summary")
         transformed_reader = iterate_with_progress(transformed_reader, total_rows=total_rows, spinner_text="Computing full summary", spinner=spinner)
+    else:
+        spinner.start(f"Sampling first {MAX_PREVIEW_ROWS:,d}...")
     preview_full_dataset(transformed_reader, sample_size, dtype_hints=dtype, full_summary=full_summary, spinner=spinner, total_rows=total_rows)
 
 
@@ -1336,7 +1391,7 @@ def cleany() -> None:
             if confirm:
                 if cols:
                     stack.add(NormalizeCurrencyPercentTransform(columns=cols))
-                    spinner.succeed("Added NormalizeCurrencyPercentTransform to the pipeline for columns: {cols}")
+                    spinner.succeed(f"Added NormalizeCurrencyPercentTransform to the pipeline for columns: {', '.join(cols)}")
                 else:
                     # No non-forced columns found; add generic transform
                     stack.add(NormalizeCurrencyPercentTransform())
@@ -1353,6 +1408,12 @@ def cleany() -> None:
             transform = prompt_remove_outliers(transformed_reader)
             if transform:
                 stack.add(transform)
+        elif action == "Remove transformation":
+            removed = prompt_remove_transforms(stack)
+            # If the user removed transforms, we already updated the stack; continue loop
+            # (no automatic preview to match the command for adding transforms)
+            if removed:
+                pass
         elif action == "Export transformed file":
             export_transformed(file, stack, dtype_hints=detected_dtypes or None, parse_dates=date_cols or None)
 
