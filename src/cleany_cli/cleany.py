@@ -18,6 +18,8 @@ import pandas as pd
 import questionary as q
 from halo import Halo
 
+spinner = Halo(text='Processing', spinner='dots')
+
 
 # endregion
 # region: Startup
@@ -1097,7 +1099,7 @@ def prompt_drop_columns(reader: Iterator[pd.DataFrame]) -> Optional[DropColumnsT
         print("No columns selected. Skipping column removal.")
         return None
 
-    print(f"✅ Will drop: {', '.join(to_drop)}")
+    spinner.succeed("Will drop: {', '.join(to_drop)}")
     return DropColumnsTransform(to_drop)
 
 
@@ -1127,7 +1129,7 @@ def prompt_remove_outliers(reader: Iterator[pd.DataFrame]) -> Optional[OutlierRe
         print("Invalid multiplier; using 1.5")
         mult = 1.5
 
-    print(f"✅ Will remove outliers on: {', '.join(to_clean)} with multiplier {mult}")
+    spinner.succeed("Will remove outliers on: {', '.join(to_clean)} with multiplier {mult}")
     return OutlierRemovalTransform(columns=to_clean, multiplier=mult)
 
 
@@ -1267,9 +1269,8 @@ def cleany() -> None:
         sys.exit(1)
 
     # Auto-detect dtypes for columns with leading zeros and dates
-    spinner = Halo(text="Scanning file for data type hints...", spinner='dots')
     try:
-        spinner.start()
+        spinner.start("Scanning file for data type hints...")
         detected_dtypes, date_cols = detect_leading_zero_columns(file)
         spinner.succeed("Done scanning file for data type hints.")
     except Exception as exc:
@@ -1335,11 +1336,11 @@ def cleany() -> None:
             if confirm:
                 if cols:
                     stack.add(NormalizeCurrencyPercentTransform(columns=cols))
-                    print(f"✅ Added NormalizeCurrencyPercentTransform to the pipeline for columns: {cols}")
+                    spinner.succeed("Added NormalizeCurrencyPercentTransform to the pipeline for columns: {cols}")
                 else:
                     # No non-forced columns found; add generic transform
                     stack.add(NormalizeCurrencyPercentTransform())
-                    print("✅ Added NormalizeCurrencyPercentTransform to the pipeline (no specific columns detected).")
+                    spinner.succeed("Added NormalizeCurrencyPercentTransform to the pipeline (no specific columns detected).")
         elif action == "Remove columns":
             reader = load_file(file, dtype=detected_dtypes or None, parse_dates=date_cols or None)
             transformed_reader = stack.apply_to_stream(reader)
