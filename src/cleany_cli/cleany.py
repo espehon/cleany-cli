@@ -1322,6 +1322,7 @@ def cleany() -> None:
     if file == "":
         print("Error: No file selected.")
         sys.exit(1)
+    file_size_print(file)
 
     # Auto-detect dtypes for columns with leading zeros and dates
     try:
@@ -1333,27 +1334,26 @@ def cleany() -> None:
         # Fall back to empty hints on failure
         detected_dtypes, date_cols = {}, []
 
-    if detected_dtypes:
-        print(f"Detected text columns (with leading zeros): {list(detected_dtypes.keys())}")
     if date_cols:
-        print(f"Detected date columns: {date_cols}")
+        spinner.succeed(f"Detected date columns: {date_cols}")
+    if detected_dtypes:
+        spinner.warn(f"Detected columns with leading zeros (text): {list(detected_dtypes.keys())}")
 
     # Initialize the transformation stack
     stack = TransformationStack()
-    file_size_print(file)
 
     # --- Startup preview + auto-normalization ---
     # Detect currency/percent-like columns in a small sample. If present,
     # auto-add NormalizeCurrencyPercentTransform to the stack so the initial
     # preview reflects the cleaned view (user can remove it later).
     try:
-        currency_cols = detect_currency_percent_columns(file, sample_size=500)
+        currency_cols = detect_currency_percent_columns(file, sample_size=1_000)
         # Exclude any columns that were explicitly hinted as text (leading zeros)
         if detected_dtypes:
             currency_cols = [c for c in currency_cols if not (c in detected_dtypes and detected_dtypes[c] is str)]
 
         if currency_cols:
-            print(f"Detected currency/percent-like columns: {currency_cols}")
+            spinner.warn(f"Detected currency/percent-like columns: {currency_cols}")
             print("Auto-adding NormalizeCurrencyPercentTransform to pipeline for initial preview.")
             stack.add(NormalizeCurrencyPercentTransform(columns=currency_cols))
             print("You can remove this transform later from the pipeline if desired.")
