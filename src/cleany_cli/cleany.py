@@ -18,6 +18,22 @@ import pandas as pd
 import questionary as q
 from halo import Halo
 
+from .transforms import (
+    Transform,
+    DropColumnsTransform,
+    RenameColumnsTransform,
+    NormalizeCurrencyPercentTransform,
+    OutlierRemovalTransform,
+    TransformationStack,
+)
+from .prompts import (
+    prompt_drop_columns,
+    prompt_rename_columns,
+    prompt_remove_outliers,
+    prompt_remove_transforms,
+    prompt_edit_normalize_transform,
+)
+
 spinner = Halo(text='Processing', spinner='dots')
 
 
@@ -32,7 +48,7 @@ MAX_PREVIEW_ROWS = 10_000               # number of rows to scan for short previ
 STREAMABLE = {'.csv', '.tsv',}
 
 header_widths = {
-    "Column": 16,
+    "Column": 24,
     "dtype": 8,
     "Missing": 10,
     "Minimum": 14,
@@ -42,190 +58,16 @@ header_widths = {
 }
 
 features = [
-    "Sample data",
-    "Preview data (datatypes, sample rows, summary statistics)",
-    "Normalize currency/percent columns",
-    "Remove columns",
-    "Remove outliers (IQR)",
-    "Remove transformation",
-    # "Rename columns",
-    # "Remove columns",
-    # "Remove duplicate rows",
-    # "Handle missing values (drop or fill)",
-    # "Filter rows based on column values",
-    # "Remove outliers (IQR or Z-score method)",
-    # "Save cleaned data to new file or overwrite existing (overwrite is not recommended)",
-    # "Can save in different formats (see supported file types above)"
-    "Export transformed file",
+    "S - 👁️  Sample data",
+    "P - 🔎 Preview data (datatypes, sample rows, summary statistics)",
+    "N - 🔣 Normalize currency/percent columns",
+    "R - ✏️  Rename columns",
+    "D - 🗑️  Remove columns",
+    "O - 📉 Remove outliers (IQR)",
+    "X - ❌ Remove transformation",
+    "E - 💾 Export transformed file",
+    "Q - 👋 Quit"
 ]
-
-
-# endregion
-# region: Transformation Pipeline
-
-class Transform(ABC):
-    """Base class for all transformations. Each transform is a reusable operation."""
-    
-    @abstractmethod
-    def apply(self, chunk: pd.DataFrame) -> pd.DataFrame:
-        """Apply this transformation to a chunk of data."""
-        pass
-    
-    @abstractmethod
-    def describe(self) -> str:
-        """Return a human-readable description of this transformation."""
-        pass
-
-
-class DropColumnsTransform(Transform):
-    """Remove specific columns from the dataframe."""
-    
-    def __init__(self, columns: list[str]):
-        self.columns = columns
-    
-    def apply(self, chunk: pd.DataFrame) -> pd.DataFrame:
-        return chunk.drop(columns=self.columns, errors='ignore')
-    
-    def describe(self) -> str:
-        return f"Drop columns: {', '.join(self.columns)}"
-
-
-class NormalizeCurrencyPercentTransform(Transform):
-    """Normalize currency and percent strings into numeric floats.
-
-    Behavior:
-    - Strips leading `$` and thousands separators (commas).
-    - If value ends with `%`, removes `%` and divides by 100.
-    - Attempts to coerce the cleaned values to numeric; if at least one
-      value coerces successfully, it replaces the column with the numeric
-      values (NaN where coercion failed).
-    """
-
-    def __init__(self, columns: Optional[list[str]] = None):
-        # If columns is None, operate on all object columns where pattern matches
-        self.columns = columns
-
-    def apply(self, chunk: pd.DataFrame) -> pd.DataFrame:
-        df = chunk.copy()
-        candidates = self.columns or df.select_dtypes(include=['object', 'string']).columns.tolist()
-        for col in candidates:
-            if col not in df.columns:
-                continue
-            try:
-                s = df[col].astype(str).str.strip()
-            except Exception:
-                continue
-
-            # Quick check if any value looks like currency or percent or numeric-like with commas
-            mask_currency = s.str.startswith('$', na=False)
-            mask_percent = s.str.endswith('%', na=False)
-            mask_commas = s.str.contains(',', na=False)
-            mask_numeric_like = s.str.match(r'^-?[0-9\.,]+%?$', na=False)
-
-            if not (mask_currency.any() or mask_percent.any() or mask_commas.any() or mask_numeric_like.any()):
-                continue
-
-            cleaned = s.str.replace(r'^\$', '', regex=True).str.replace(',', '')
-            pct_mask = cleaned.str.endswith('%', na=False)
-            cleaned_num = cleaned.str.rstrip('%')
-            cleaned_num = cleaned_num.replace({'nan': None, 'None': None})
-            coerced = pd.to_numeric(cleaned_num, errors='coerce')
-            if pct_mask.any():
-                coerced.loc[pct_mask] = coerced.loc[pct_mask] / 100.0
-
-            # If at least one value converted to numeric, replace the column with coerced
-            if coerced.notna().any():
-                df[col] = coerced
-
-        return df
-
-    def describe(self) -> str:
-        if self.columns:
-            return f"Normalize currency/percent in columns: {', '.join(self.columns)}"
-        return "Normalize currency/percent in inferred columns"
-
-
-class OutlierRemovalTransform(Transform):
-    """Remove rows with outliers based on per-chunk IQR for specified columns.
-
-    This operates per-chunk (streaming-friendly). For each specified column,
-    it computes Q1/Q3 and removes rows outside [Q1 - k*IQR, Q3 + k*IQR].
-    """
-
-    def __init__(self, columns: list[str], multiplier: float = 1.5):
-        self.columns = columns
-        self.multiplier = float(multiplier)
-
-    def apply(self, chunk: pd.DataFrame) -> pd.DataFrame:
-        if not self.columns:
-            return chunk
-        mask = pd.Series(True, index=chunk.index)
-        for col in self.columns:
-            if col not in chunk.columns:
-                continue
-            # coerce to numeric; non-convertible values become NaN and are preserved
-            num = pd.to_numeric(chunk[col], errors='coerce')
-            if num.dropna().empty:
-                continue
-            q1 = num.quantile(0.25)
-            q3 = num.quantile(0.75)
-            iqr = q3 - q1
-            lower = q1 - self.multiplier * iqr
-            upper = q3 + self.multiplier * iqr
-            # keep NaNs (they are not outliers here)
-            mask &= (num.isna()) | ((num >= lower) & (num <= upper))
-        # return filtered chunk
-        return chunk.loc[mask]
-
-    def describe(self) -> str:
-        return f"Remove outliers (IQR x{self.multiplier}) on: {', '.join(self.columns)}"
-
-
-class TransformationStack:
-    """
-    Manages a stack of transformations to be applied to data streams.
-    
-    Instead of modifying data immediately, we build up a list of transformations
-    that get applied each time we stream through the file. This preserves the 
-    original file and makes it easy to undo/redo operations.
-    """
-    
-    def __init__(self):
-        self.transforms: list[Transform] = []
-    
-    def add(self, transform: Transform) -> None:
-        """Add a transformation to the stack."""
-        self.transforms.append(transform)
-    
-    def remove_last(self) -> Optional[Transform]:
-        """Undo the last transformation."""
-        if self.transforms:
-            return self.transforms.pop()
-        return None
-    
-    def apply_to_chunk(self, chunk: pd.DataFrame) -> pd.DataFrame:
-        """Apply all transformations in order to a single chunk."""
-        for transform in self.transforms:
-            chunk = transform.apply(chunk)
-        return chunk
-    
-    def apply_to_stream(self, reader: Iterator[pd.DataFrame]) -> Iterator[pd.DataFrame]:
-        """
-        Apply all transformations to each chunk in a stream.
-        This is the key pattern: transformations are applied chunk-by-chunk,
-        keeping memory usage low.
-        """
-        for chunk in reader:
-            yield self.apply_to_chunk(chunk)
-    
-    def describe(self) -> str:
-        """Return a list of all transformations in the stack."""
-        if not self.transforms:
-            return "No transformations applied"
-        lines = ["Active transformations:"]
-        for i, transform in enumerate(self.transforms, 1):
-            lines.append(f"  {i}. {transform.describe()}")
-        return "\n".join(lines)
 
 
 # endregion
@@ -1091,106 +933,6 @@ def preview_full_dataset(data: Iterator[pd.DataFrame], sample_size: int = 1, dty
 
 
 
-
-
-
-
-def prompt_drop_columns(reader: Iterator[pd.DataFrame]) -> Optional[DropColumnsTransform]:
-    """
-    Ask user which columns to drop and return a DropColumnsTransform.
-    
-    This function CONSUMES the first chunk to get column names, so caller
-    must reload the reader after calling this function.
-    """
-    try:
-        first_chunk = next(reader)
-    except StopIteration:
-        print("No data to preview. Skipping column removal.")
-        return None
-    
-    columns = first_chunk.columns.tolist()
-
-    # Ask user which columns to drop
-    to_drop = q.checkbox(
-        "Select columns to remove:",
-        choices=columns
-    ).ask()
-
-    if not to_drop:
-        print("No columns selected. Skipping column removal.")
-        return None
-
-    spinner.succeed(f"Will drop: {', '.join(to_drop)}")
-    return DropColumnsTransform(to_drop)
-
-
-def prompt_remove_outliers(reader: Iterator[pd.DataFrame]) -> Optional[OutlierRemovalTransform]:
-    """Prompt user to select numeric columns to remove outliers from, and multiplier."""
-    try:
-        first_chunk = next(reader)
-    except StopIteration:
-        print("No data to preview. Skipping outlier removal.")
-        return None
-
-    # Find numeric columns in the first chunk
-    numeric_cols = first_chunk.select_dtypes(include=['number']).columns.tolist()
-    if not numeric_cols:
-        print("No numeric columns detected in the sample. Skipping outlier removal.")
-        return None
-
-    to_clean = q.checkbox("Select numeric columns to remove outliers from:", choices=numeric_cols).ask()
-    if not to_clean:
-        print("No columns selected. Skipping outlier removal.")
-        return None
-
-    multiplier_txt = q.text("IQR multiplier (default 1.5):", default="1.5").ask()
-    try:
-        mult = float(multiplier_txt)
-    except Exception:
-        print("Invalid multiplier; using 1.5")
-        mult = 1.5
-
-    spinner.succeed(f"Will remove outliers on: {', '.join(to_clean)} with multiplier {mult}")
-    return OutlierRemovalTransform(columns=to_clean, multiplier=mult)
-
-
-def prompt_remove_transforms(stack: TransformationStack) -> Optional[list[Transform]]:
-    """Prompt the user to select one or more transforms to remove from the stack.
-
-    Returns a list of removed transforms, or None if nothing was removed.
-    """
-    if not stack.transforms:
-        print("No transformations in the pipeline to remove.")
-        return None
-
-    titles = [f"{i+1}. {t.describe()}" for i, t in enumerate(stack.transforms)]
-    selected = q.checkbox("Select transforms to remove (checked):", choices=titles).ask()
-    if not selected:
-        print("No transforms selected. No changes made.")
-        return None
-
-    # Parse indices and remove in reverse order to avoid shifting
-    try:
-        indices = sorted([int(s.split('.', 1)[0]) - 1 for s in selected], reverse=True)
-    except Exception:
-        print("Could not parse selection. No changes made.")
-        return None
-
-    removed: list[Transform] = []
-    for idx in indices:
-        try:
-            removed.append(stack.transforms.pop(idx))
-        except Exception:
-            continue
-
-    if removed:
-        spinner.succeed(f"Removed {len(removed)} transform(s): {', '.join(r.describe() for r in removed)}")
-        return removed
-
-    print("No transforms were removed.")
-    return None
-
-
 def preview_with_transformations(
     filepath: str, 
     stack: TransformationStack,
@@ -1316,7 +1058,10 @@ def export_transformed(
 # endregion
 # region: Main
 def cleany() -> None:
-    argument = str(sys.argv[1])
+    if len(sys.argv) > 1:
+        argument = str(sys.argv[1])
+    else:
+        argument = ""    
     inspect_argument(argument)
     file = find_file(argument)
     if file == "":
@@ -1369,52 +1114,73 @@ def cleany() -> None:
     looping = True
     while looping:
         print(f"\n{stack.describe()}")
-        action = q.select("Select an action:", choices=features + ["Exit"]).ask()
+        action = q.select("Select an action:", choices=features).ask()
 
-        if action == "Exit":
+        if action:
+            action = action[0]
+
+        if action == "Q": # Quit
             sys.exit(0)
-        elif action == features[0]: # Sample data
+        elif action == "S": # Sample data
             preview_with_transformations(file, stack, dtype=detected_dtypes or None, parse_dates=date_cols or None, full_summary=False)
 
-        elif action == features[1]: # Preview data
+        elif action == "P": # Preview data
             full = q.confirm("Compute full summary (min/max/avg) — this may be slow. Run full summary?", default=False).ask()
             if full:
                 preview_with_transformations(file, stack, dtype=detected_dtypes or None, parse_dates=date_cols or None, full_summary=True)
-        elif action == "Normalize currency/percent columns":
-            # Add normalization transform to the stack (applies to future streaming reads)
-            # Exclude any columns forced to `str` by earlier detection (leading zeros)
-            cols = detect_currency_percent_columns(file, sample_size=500)
-            if detected_dtypes:
-                cols = [c for c in cols if not (c in detected_dtypes and detected_dtypes[c] is str)]
-
-            confirm = q.confirm("Add NormalizeCurrencyPercentTransform to pipeline? This will convert $ and % values to numeric.", default=True).ask()
-            if confirm:
-                if cols:
-                    stack.add(NormalizeCurrencyPercentTransform(columns=cols))
-                    spinner.succeed(f"Added NormalizeCurrencyPercentTransform to the pipeline for columns: {', '.join(cols)}")
+        elif action == "N": # Normalize currency/percent columns
+            # If a normalize transform already exists, allow editing which columns it applies to.
+            if any(isinstance(t, NormalizeCurrencyPercentTransform) for t in stack.transforms):
+                updated = prompt_edit_normalize_transform(stack, file, detected_dtypes=detected_dtypes)
+                if updated:
+                    preview_with_transformations(file, stack, dtype=detected_dtypes or None, parse_dates=date_cols or None, full_summary=False)
                 else:
-                    # No non-forced columns found; add generic transform
-                    stack.add(NormalizeCurrencyPercentTransform())
-                    spinner.succeed("Added NormalizeCurrencyPercentTransform to the pipeline (no specific columns detected).")
-        elif action == "Remove columns":
+                    print("No changes made to existing NormalizeCurrencyPercentTransform.")
+            else:
+                # Add normalization transform to the stack (applies to future streaming reads)
+                # Exclude any columns forced to `str` by earlier detection (leading zeros)
+                cols = detect_currency_percent_columns(file, sample_size=500)
+                if detected_dtypes:
+                    cols = [c for c in cols if not (c in detected_dtypes and detected_dtypes[c] is str)]
+
+                confirm = q.confirm("Add NormalizeCurrencyPercentTransform to pipeline? This will convert $ and % values to numeric.", default=True).ask()
+                if confirm:
+                    # create and add transform with detected columns (may be empty -> inferred)
+                    initial_cols = cols if cols else None
+                    stack.add(NormalizeCurrencyPercentTransform(columns=initial_cols))
+                    if initial_cols:
+                        spinner.succeed(f"Added NormalizeCurrencyPercentTransform to the pipeline for columns: {', '.join(initial_cols)}")
+                    else:
+                        spinner.succeed("Added NormalizeCurrencyPercentTransform to the pipeline (no specific columns detected).")
+                    # Immediately allow the user to toggle/edit which columns the transform applies to
+                    edited = prompt_edit_normalize_transform(stack, file, detected_dtypes=detected_dtypes)
+                    if edited:
+                        preview_with_transformations(file, stack, dtype=detected_dtypes or None, parse_dates=date_cols or None, full_summary=False)
+        elif action == "R": # Rename columns
+            reader = load_file(file, dtype=detected_dtypes or None, parse_dates=date_cols or None)
+            transformed_reader = stack.apply_to_stream(reader)
+            transform = prompt_rename_columns(transformed_reader)
+            if transform:
+                stack.add(transform)
+        elif action == "D": # Remove columns
             reader = load_file(file, dtype=detected_dtypes or None, parse_dates=date_cols or None)
             transformed_reader = stack.apply_to_stream(reader)
             transform = prompt_drop_columns(transformed_reader)
             if transform:
                 stack.add(transform)
-        elif action == "Remove outliers (IQR)":
+        elif action == "O": # Remove outliers (IQR)
             reader = load_file(file, dtype=detected_dtypes or None, parse_dates=date_cols or None)
             transformed_reader = stack.apply_to_stream(reader)
             transform = prompt_remove_outliers(transformed_reader)
             if transform:
                 stack.add(transform)
-        elif action == "Remove transformation":
+        elif action == "X": # Remove transformation
             removed = prompt_remove_transforms(stack)
             # If the user removed transforms, we already updated the stack; continue loop
             # (no automatic preview to match the command for adding transforms)
             if removed:
                 pass
-        elif action == "Export transformed file":
+        elif action == "E": # Export transformed file
             export_transformed(file, stack, dtype_hints=detected_dtypes or None, parse_dates=date_cols or None)
 
 # endregion
